@@ -2893,6 +2893,7 @@ class App:
         top = ttk.Frame(outer)
         top.pack(fill=tk.X)
         ttk.Button(top, text="Refresh Stats", command=self._refresh_stats).pack(side=tk.LEFT)
+        ttk.Button(top, text="Export Stats", command=self._export_stats).pack(side=tk.LEFT, padx=(8, 0))
         self._stats_status = tk.StringVar(value="Click Refresh Stats after connecting to a database.")
         ttk.Label(top, textvariable=self._stats_status).pack(side=tk.LEFT, padx=12)
 
@@ -2908,6 +2909,7 @@ class App:
         self._apply_theme_to_text(self._stats_text)
         _bind_mousewheel(self._stats_text)
         self._stats_cloud_ref: Optional[ImageTk.PhotoImage] = None  # prevent GC
+        self._stats_cloud_pil: Optional[Image.Image] = None  # PIL copy for export
 
     def _generate_word_cloud(self, word_freq: list[tuple[str, int]], width: int = 800, height: int = 400) -> Optional[ImageTk.PhotoImage]:
         """Generate a word cloud image from (word, count) pairs using PIL only."""
@@ -2978,6 +2980,7 @@ class App:
             if not placed:
                 break  # canvas full
 
+        self._stats_cloud_pil = img  # keep PIL copy for export
         return ImageTk.PhotoImage(img)
 
     def _refresh_stats(self) -> None:
@@ -3392,6 +3395,131 @@ class App:
 
         self._stats_text.configure(state="disabled")
         self._stats_status.set(f"Stats loaded — {msg_count:,} messages, {chat_count:,} chats")
+
+    # ---------- Export Stats ----------
+
+    def _export_stats(self) -> None:
+        """Export the current Stats tab content as HTML or plain text."""
+        txt = self._stats_text.get("1.0", tk.END).strip()
+        if not txt:
+            messagebox.showwarning("No stats", "Refresh Stats first.")
+            return
+
+        p = filedialog.asksaveasfilename(
+            title="Export Stats",
+            defaultextension=".html",
+            filetypes=[("HTML", "*.html"), ("Text", "*.txt")],
+        )
+        if not p:
+            return
+
+        is_html = p.lower().endswith(".html") or p.lower().endswith(".htm")
+
+        if is_html:
+            self._export_stats_html(p, txt)
+        else:
+            self._export_stats_txt(p, txt)
+
+    def _export_stats_txt(self, path: str, txt: str) -> None:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(txt)
+            self._stats_status.set(f"Stats exported to {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Export error", str(exc))
+
+    def _export_stats_html(self, path: str, txt: str) -> None:
+        th = self.theme
+        bg = th.get("text_bg", "#ffffff")
+        fg = th.get("text_fg", "#000000")
+        accent = th.get("accent", fg)
+        font = th.get("mono_family", "Consolas")
+        size = th.get("mono_size", 10)
+
+        # Encode word cloud as inline base64 if available
+        cloud_b64 = ""
+        try:
+            if self._stats_cloud_ref is not None:
+                # Extract PIL Image from the PhotoImage
+                pi = self._stats_cloud_ref
+                w, h = pi.width(), pi.height()
+                im = Image.new("RGB", (w, h))
+                # Build from string data
+                data = pi.get(0, 0)  # test access
+                # Alternative: re-generate the cloud to get PIL Image
+                pass
+        except Exception:
+            pass
+
+        # Try to re-generate word cloud as PNG bytes for the export
+        cloud_html = ""
+        try:
+            from io import BytesIO as _BytesIO
+            import base64 as _b64
+            # Rebuild cloud from the _generate_word_cloud method internals
+            # The simplest way: just grab the word cloud data from the text widget
+            # Actually re-generate if we have the combined word data
+            # We stored top_combined on the instance if available
+            if hasattr(self, '_stats_cloud_pil') and self._stats_cloud_pil is not None:
+                buf = _BytesIO()
+                self._stats_cloud_pil.save(buf, format="PNG")
+                cloud_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+                cloud_html = f'<div style="text-align:center;margin:16px 0"><img src="data:image/png;base64,{cloud_b64}" style="max-width:100%" alt="Word Cloud"></div>'
+        except Exception:
+            pass
+
+        import html as _html
+
+        # Convert text lines into themed HTML
+        html_lines: list[str] = []
+        for line in txt.split("\n"):
+            if line.startswith("═"):
+                # Section header
+                title = line.replace("═", "").strip()
+                html_lines.append(f'<h2 style="color:{accent};border-bottom:2px solid {accent};padding-bottom:4px;margin-top:24px">{_html.escape(title)}</h2>')
+            else:
+                html_lines.append(f'<pre style="margin:0;line-height:1.5">{_html.escape(line)}</pre>')
+
+        # Insert word cloud image after the "WORD CLOUD" header
+        if cloud_html:
+            for i, hl in enumerate(html_lines):
+                if "WORD CLOUD" in hl:
+                    html_lines.insert(i + 1, cloud_html)
+                    break
+
+        body = "\n".join(html_lines)
+
+        doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Signal Stats Export</title>
+<style>
+  body {{
+    background: {bg};
+    color: {fg};
+    font-family: '{font}', 'Consolas', 'Courier New', monospace;
+    font-size: {size}pt;
+    padding: 24px;
+    max-width: 960px;
+    margin: 0 auto;
+  }}
+  h2 {{ font-size: {size + 3}pt; }}
+  pre {{ white-space: pre-wrap; word-wrap: break-word; }}
+</style>
+</head>
+<body>
+<h1 style="color:{accent}">Signal Export — Stats</h1>
+{body}
+</body>
+</html>"""
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(doc)
+            self._stats_status.set(f"Stats exported to {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Export error", str(exc))
 
     def _export_search_csv(self) -> None:
         if not self._search_rows:
