@@ -3290,25 +3290,63 @@ class App:
         except Exception:
             pass
 
-        # --- Most used words ---
+        # --- Most used words (split: You / Them / Combined) ---
+        top_combined: list[tuple[str, int]] = []
         try:
             word_re = re.compile(r"[a-zA-Z'\u2019]+")
-            word_counts: dict[str, int] = {}
-            for r in all_bodies:  # reuse from emoji section
-                for w in word_re.findall(r[0]):
-                    wl = w.lower().replace("'", "").replace("\u2019", "")
-                    if len(wl) >= 3 and wl not in _STOP_WORDS:
-                        word_counts[wl] = word_counts.get(wl, 0) + 1
-            top_words = sorted(word_counts.items(), key=lambda x: -x[1])[:40]
-            if top_words:
-                lines.append("═══════════════ MOST USED WORDS (top 40) ═══════════════")
-                max_wc = top_words[0][1]
-                for w, c in top_words:
-                    bar_len = int(c / max_wc * 25)
+
+            def _count_words(rows):
+                counts: dict[str, int] = {}
+                for r in rows:
+                    for w in word_re.findall(r[0]):
+                        wl = w.lower().replace("'", "").replace("\u2019", "")
+                        if len(wl) >= 3 and wl not in _STOP_WORDS:
+                            counts[wl] = counts.get(wl, 0) + 1
+                return counts
+
+            def _render_top(counts, n=40):
+                top = sorted(counts.items(), key=lambda x: -x[1])[:n]
+                if not top:
+                    return top
+                mx = top[0][1]
+                for w, c in top:
+                    bar_len = int(c / mx * 25)
+                    lines.append(f"  {w:<20}  {'█' * bar_len}  {c:,}")
+                return top
+
+            your_bodies = _qall("SELECT body FROM messages WHERE body IS NOT NULL AND body != '' AND outgoing = 1")
+            their_bodies = _qall("SELECT body FROM messages WHERE body IS NOT NULL AND body != '' AND outgoing = 0")
+
+            your_counts = _count_words(your_bodies)
+            their_counts = _count_words(their_bodies)
+
+            # Combined (for word cloud)
+            all_counts: dict[str, int] = {}
+            for wl, c in your_counts.items():
+                all_counts[wl] = all_counts.get(wl, 0) + c
+            for wl, c in their_counts.items():
+                all_counts[wl] = all_counts.get(wl, 0) + c
+
+            if your_counts:
+                lines.append("═══════════════ YOUR MOST USED WORDS (top 40) ═══════════════")
+                _render_top(your_counts)
+                lines.append("")
+
+            if their_counts:
+                lines.append("═══════════════ THEIR MOST USED WORDS (top 40) ═══════════════")
+                _render_top(their_counts)
+                lines.append("")
+
+            top_combined = sorted(all_counts.items(), key=lambda x: -x[1])[:40]
+            if top_combined:
+                lines.append("═══════════════ COMBINED MOST USED WORDS (top 40) ═══════════════")
+                mx = top_combined[0][1]
+                for w, c in top_combined:
+                    bar_len = int(c / mx * 25)
                     lines.append(f"  {w:<20}  {'█' * bar_len}  {c:,}")
                 lines.append("")
 
-                # --- Word Cloud ---
+                # --- Word Cloud (combined) ---
                 lines.append("═══════════════ WORD CLOUD ═══════════════")
                 lines.append("")
                 lines.append("<<WORDCLOUD>>")
@@ -3343,7 +3381,7 @@ class App:
         if len(parts) > 1:
             # Generate and insert word cloud image
             try:
-                cloud_img = self._generate_word_cloud(top_words, width=800, height=400)
+                cloud_img = self._generate_word_cloud(top_combined, width=800, height=400)
                 if cloud_img:
                     self._stats_cloud_ref = cloud_img
                     self._stats_text.image_create(tk.END, image=cloud_img)
