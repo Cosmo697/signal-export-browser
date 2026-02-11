@@ -40,9 +40,32 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
 import tkinter.font as tkfont
 
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 
 import build_signal_db
+
+# Common English stop words to exclude from word frequency / word cloud
+_STOP_WORDS: frozenset[str] = frozenset(
+    "i me my myself we our ours ourselves you your yours yourself yourselves "
+    "he him his himself she her hers herself it its itself they them their "
+    "theirs themselves what which who whom this that these those am is are was "
+    "were be been being have has had having do does did doing a an the and but "
+    "if or because as until while of at by for with about against between "
+    "through during before after above below to from up down in out on off "
+    "over under again further then once here there when where why how all any "
+    "both each few more most other some such no nor not only own same so than "
+    "too very s t can will just don should now d ll m o re ve y ain aren "
+    "couldn didn doesn hadn hasn haven isn ma mightn mustn needn shan shouldn "
+    "wasn weren won wouldn could would might must shall also got get still "
+    "really like yeah yes ok okay oh hey hi hello right well much back "
+    "going one go see know think even way want going things thing just "
+    "im thats dont cant didnt youre ill ive youve theyre wont hes shes "
+    "its theres whats lets wouldnt couldnt shouldnt wasnt werent isnt "
+    "arent hasnt havent hadnt whos thats wheres heres theres whens whys hows "
+    "something anything nothing everything someone anyone everyone "
+    "lol haha lmao omg idk gonna wanna ya yea nah "
+    "http https www com org net".split()
+)
 
 
 @dataclass
@@ -2841,6 +2864,78 @@ class App:
         container.rowconfigure(0, weight=1)
         self._apply_theme_to_text(self._stats_text)
         _bind_mousewheel(self._stats_text)
+        self._stats_cloud_ref: Optional[ImageTk.PhotoImage] = None  # prevent GC
+
+    def _generate_word_cloud(self, word_freq: list[tuple[str, int]], width: int = 800, height: int = 400) -> Optional[ImageTk.PhotoImage]:
+        """Generate a word cloud image from (word, count) pairs using PIL only."""
+        if not word_freq:
+            return None
+        try:
+            bg = self.theme.get("app_bg", "#1e1e2e")
+            # Parse bg to RGB tuple
+            bg_rgb = tuple(int(bg.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+        except Exception:
+            bg_rgb = (30, 30, 46)
+
+        img = Image.new("RGB", (width, height), bg_rgb)
+        draw = ImageDraw.Draw(img)
+
+        # Colour palette for words
+        palette = [
+            "#89b4fa", "#a6e3a1", "#f9e2af", "#f38ba8", "#cba6f7",
+            "#fab387", "#94e2d5", "#89dceb", "#f5c2e7", "#74c7ec",
+            "#b4befe", "#eba0ac",
+        ]
+
+        max_cnt = word_freq[0][1] if word_freq else 1
+        # Use up to 80 words
+        words = word_freq[:80]
+
+        import random as _rng
+        _rng.seed(42)  # deterministic layout
+
+        # Occupied rectangles for collision avoidance
+        occupied: list[tuple[int, int, int, int]] = []
+
+        def _overlaps(x1: int, y1: int, x2: int, y2: int) -> bool:
+            for ox1, oy1, ox2, oy2 in occupied:
+                if x1 < ox2 and x2 > ox1 and y1 < oy2 and y2 > oy1:
+                    return True
+            return False
+
+        for idx, (word, cnt) in enumerate(words):
+            # Font size proportional to frequency (log scale looks better)
+            import math
+            ratio = math.log1p(cnt) / math.log1p(max_cnt)
+            font_size = max(12, int(10 + ratio * 48))
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except Exception:
+                try:
+                    font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+                except Exception:
+                    font = ImageFont.load_default()
+
+            color = palette[idx % len(palette)]
+            color_rgb = tuple(int(color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+
+            bbox = font.getbbox(word)
+            tw, th = int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
+
+            # Try random placements
+            placed = False
+            for _ in range(200):
+                x = _rng.randint(4, max(5, width - tw - 4))
+                y = _rng.randint(4, max(5, height - th - 4))
+                if not _overlaps(x, y, x + tw + 4, y + th + 4):
+                    draw.text((x, y), word, fill=color_rgb, font=font)
+                    occupied.append((x - 2, y - 2, x + tw + 6, y + th + 6))
+                    placed = True
+                    break
+            if not placed:
+                break  # canvas full
+
+        return ImageTk.PhotoImage(img)
 
     def _refresh_stats(self) -> None:
         if self._conn is None and not self._connect():
@@ -3022,12 +3117,198 @@ class App:
             longest = _q1("SELECT MAX(LENGTH(body)) FROM messages")
             if longest:
                 lines.append(f"  Longest message:            {longest:,} chars")
+            empty = _q1("SELECT COUNT(*) FROM messages WHERE body IS NULL OR body = ''") or 0
+            lines.append(f"  Empty messages (media-only): {empty:,}  ({empty*100/msg_count:.1f}%)")
+            lines.append("")
+
+        # --- Who texts first (conversation openers) ---
+        # A message is a "conversation opener" if it's the first message in a chat after 4+ hour gap
+        try:
+            opener_rows = _qall("""
+                WITH ordered AS (
+                    SELECT chatId, outgoing, dateSentMs,
+                           LAG(dateSentMs) OVER (PARTITION BY chatId ORDER BY dateSentMs) AS prev_ms
+                    FROM messages WHERE dateSentMs IS NOT NULL
+                )
+                SELECT
+                    CASE WHEN outgoing = 1 THEN 'You' ELSE 'Them' END AS who,
+                    COUNT(*) AS cnt
+                FROM ordered
+                WHERE prev_ms IS NULL OR (dateSentMs - prev_ms) > 14400000
+                GROUP BY outgoing
+            """)
+            if opener_rows:
+                lines.append("═══════════════ WHO TEXTS FIRST ═══════════════")
+                lines.append("  (first message after 4+ hour gap)")
+                total_openers = sum(r[1] for r in opener_rows)
+                for r in opener_rows:
+                    pct = r[1] * 100 / total_openers if total_openers else 0
+                    lines.append(f"  {r[0]:<6}  {r[1]:,}  ({pct:.1f}%)")
+                lines.append("")
+        except Exception:
+            pass
+
+        # --- Longest streaks (consecutive days with messages) ---
+        try:
+            day_rows = _qall("""
+                SELECT DISTINCT date(dateSentIso) AS d
+                FROM messages WHERE dateSentIso IS NOT NULL
+                ORDER BY d
+            """)
+            if day_rows:
+                from datetime import timedelta
+                days_list = [datetime.fromisoformat(r[0]).date() for r in day_rows if r[0]]
+                best_streak = cur_streak = 1
+                best_start = cur_start = days_list[0] if days_list else None
+                best_end = cur_end = best_start
+                for i in range(1, len(days_list)):
+                    if (days_list[i] - days_list[i - 1]).days == 1:
+                        cur_streak += 1
+                        cur_end = days_list[i]
+                    else:
+                        if cur_streak > best_streak:
+                            best_streak = cur_streak
+                            best_start = cur_start
+                            best_end = cur_end
+                        cur_streak = 1
+                        cur_start = days_list[i]
+                        cur_end = days_list[i]
+                if cur_streak > best_streak:
+                    best_streak = cur_streak
+                    best_start = cur_start
+                    best_end = cur_end
+                lines.append("═══════════════ STREAKS & ACTIVITY ═══════════════")
+                lines.append(f"  Days with messages:  {len(days_list):,}")
+                lines.append(f"  Longest streak:      {best_streak} consecutive days")
+                if best_start and best_end:
+                    lines.append(f"    ({best_start.isoformat()} → {best_end.isoformat()})")
+                lines.append("")
+        except Exception:
+            pass
+
+        # --- Top shared domains ---
+        try:
+            url_rows = _qall("""
+                SELECT body FROM messages
+                WHERE body LIKE '%http://%' OR body LIKE '%https://%'
+            """)
+            if url_rows:
+                from collections import Counter as _Counter
+                domain_counts: dict[str, int] = {}
+                url_re = re.compile(r'https?://([^/\s?#]+)')
+                for r in url_rows:
+                    for m in url_re.finditer(r[0] or ""):
+                        dom = m.group(1).lower()
+                        domain_counts[dom] = domain_counts.get(dom, 0) + 1
+                top_domains = sorted(domain_counts.items(), key=lambda x: -x[1])[:15]
+                if top_domains:
+                    lines.append("═══════════════ TOP SHARED DOMAINS ═══════════════")
+                    for dom, cnt in top_domains:
+                        lines.append(f"  {dom:<40}  {cnt:,}")
+                    lines.append("")
+        except Exception:
+            pass
+
+        # --- Emoji usage ---
+        try:
+            emoji_re = re.compile(
+                '['
+                '\U0001F600-\U0001F64F'  # emoticons
+                '\U0001F300-\U0001F5FF'  # symbols & pictographs
+                '\U0001F680-\U0001F6FF'  # transport
+                '\U0001F1E0-\U0001F1FF'  # flags
+                '\U00002702-\U000027B0'
+                '\U0001F900-\U0001F9FF'  # supplemental
+                '\U0001FA00-\U0001FA6F'  # chess/extended-A
+                '\U0001FA70-\U0001FAFF'  # extended-A cont
+                '\U00002600-\U000026FF'  # misc
+                '\U0000FE00-\U0000FE0F'  # variation selectors
+                '\U0000200D'             # ZWJ
+                '\U00002764'             # heart
+                ']+'
+            )
+            all_bodies = _qall("SELECT body FROM messages WHERE body IS NOT NULL AND body != ''")
+            emoji_counts: dict[str, int] = {}
+            for r in all_bodies:
+                for m in emoji_re.finditer(r[0]):
+                    e = m.group()
+                    emoji_counts[e] = emoji_counts.get(e, 0) + 1
+            top_emoji = sorted(emoji_counts.items(), key=lambda x: -x[1])[:20]
+            if top_emoji:
+                lines.append("═══════════════ TOP 20 EMOJIS ═══════════════")
+                total_emoji = sum(emoji_counts.values())
+                lines.append(f"  Unique emojis used: {len(emoji_counts):,}   Total emoji uses: {total_emoji:,}")
+                # Display in rows of 5
+                for i in range(0, len(top_emoji), 5):
+                    chunk = top_emoji[i:i+5]
+                    parts = [f"{e} ×{c:,}" for e, c in chunk]
+                    lines.append("  " + "   ".join(parts))
+                lines.append("")
+        except Exception:
+            pass
+
+        # --- Most used words ---
+        try:
+            word_re = re.compile(r"[a-zA-Z']+")
+            word_counts: dict[str, int] = {}
+            for r in all_bodies:  # reuse from emoji section
+                for w in word_re.findall(r[0]):
+                    wl = w.lower().strip("'")
+                    if len(wl) >= 3 and wl not in _STOP_WORDS:
+                        word_counts[wl] = word_counts.get(wl, 0) + 1
+            top_words = sorted(word_counts.items(), key=lambda x: -x[1])[:40]
+            if top_words:
+                lines.append("═══════════════ MOST USED WORDS (top 40) ═══════════════")
+                max_wc = top_words[0][1]
+                for w, c in top_words:
+                    bar_len = int(c / max_wc * 25)
+                    lines.append(f"  {w:<20}  {'█' * bar_len}  {c:,}")
+                lines.append("")
+
+                # --- Word Cloud ---
+                lines.append("═══════════════ WORD CLOUD ═══════════════")
+                lines.append("")
+                lines.append("<<WORDCLOUD>>")
+                lines.append("")
+        except Exception:
+            pass
+
+        # --- Yearly message volume ---
+        yearly = _qall("""
+            SELECT substr(dateSentIso, 1, 4) AS yr, COUNT(*) AS cnt
+            FROM messages WHERE dateSentIso IS NOT NULL
+            GROUP BY yr ORDER BY yr
+        """)
+        if yearly and len(yearly) > 1:
+            lines.append("═══════════════ MESSAGES BY YEAR ═══════════════")
+            max_cnt = max(r[1] for r in yearly)
+            for r in yearly:
+                bar_len = int(r[1] / max_cnt * 30) if max_cnt else 0
+                lines.append(f"  {r[0]}  {'█' * bar_len}  {r[1]:,}")
             lines.append("")
 
         report = "\n".join(lines)
+
+        # Render into Text widget
         self._stats_text.configure(state="normal")
         self._stats_text.delete("1.0", tk.END)
-        self._stats_text.insert("1.0", report)
+
+        # Split on word cloud placeholder to embed image
+        parts = report.split("<<WORDCLOUD>>")
+        self._stats_text.insert(tk.END, parts[0])
+
+        if len(parts) > 1:
+            # Generate and insert word cloud image
+            try:
+                cloud_img = self._generate_word_cloud(top_words, width=800, height=400)
+                if cloud_img:
+                    self._stats_cloud_ref = cloud_img
+                    self._stats_text.image_create(tk.END, image=cloud_img)
+                    self._stats_text.insert(tk.END, "\n")
+            except Exception:
+                self._stats_text.insert(tk.END, "  (word cloud generation failed)\n")
+            self._stats_text.insert(tk.END, parts[1])
+
         self._stats_text.configure(state="disabled")
         self._stats_status.set(f"Stats loaded — {msg_count:,} messages, {chat_count:,} chats")
 
