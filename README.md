@@ -10,9 +10,12 @@ A desktop GUI for browsing, searching, and exporting your Signal message history
 - **Media gallery** with dynamic grid layout, thumbnails for images/video/audio, and media type filtering
 - **Theming system** with stock presets (Signal Dark, Terminal, Solarized, etc.), live editing, import/export, and persistent settings
 - **Attachment viewer** — click to open any attachment; right-click to copy path/filename
+- **Stats dashboard** — message counts, date ranges, busiest months, top conversations, attachment breakdown, MIME types, largest files, day-of-week / hour-of-day heatmaps, top emojis, top shared domains, who-texts-first analysis, conversation streaks, yearly volume, and more
+- **Word frequency analysis** — split into Your / Their / Combined top-40 lists, with a generated word cloud image (NLTK-grade stop-word filtering)
+- **Stats export** — save the full stats report as themed HTML (with inline word cloud) or plain text
 - **HTML export** with inline thumbnails, themed styling, and full metadata
 - **DB builder** — converts `main.jsonl` into a searchable SQLite database with FTS5, speaker names, and attachment resolution
-- **Filters** — filter by "has attachments", "has links", date range, and more
+- **Filters** — filter by "has attachments", "has links", date range, direction (in/out), attachment type, and more
 - **Thumbnail caching** — persistent `.thumbcache/` directory with ffmpeg frame extraction for video and cover art for audio
 - **DB status panel** showing conversation and message statistics
 
@@ -102,9 +105,25 @@ Type in the search box and results appear automatically (debounced). Use the fil
 
 Open **Settings → Theme** to choose from stock presets or create your own. Themes are saved to `theme.json` and restored on next launch.
 
+### Stats
+
+Go to the **Stats** tab and click **Refresh Stats**. The dashboard shows:
+
+- Overview (messages, chats, attachments), date range, busiest months
+- Top conversations by message count
+- Attachment breakdown by type, top MIME types, largest files
+- Day-of-week and hour-of-day message distributions
+- Top emojis, top shared domains, who-texts-first analysis
+- Conversation streaks, yearly message volume
+- **Your top 40 words**, **Their top 40 words**, and **Combined top 40** — with a generated word cloud
+
+Click **Export Stats** to save everything as HTML or plain text.
+
 ### Exporting
 
-Select a conversation and use the **Export** tab to generate a styled HTML file with inline thumbnails and full message metadata.
+- **Search results** — export as CSV or HTML from the Search tab
+- **Threads** — export a full conversation as styled HTML or Markdown from the Export tab
+- **Stats** — click **Export Stats** on the Stats tab to save as themed HTML (with word cloud) or plain text
 
 ## Optional: ffmpeg
 
