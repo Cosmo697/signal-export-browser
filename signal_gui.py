@@ -86,6 +86,8 @@ _STOP_WORDS: frozenset[str] = frozenset(
     "bye thanks thank please sorry wow oh ooh ahh hmm umm "
     "maybe probably definitely literally actually basically seriously "
     "pretty really just like well anyway "
+    # --- Extra missing / messaging filler ---
+    "into set send sent stuff man dude cool shit "
     # --- URL fragments ---
     "http https www com org net".split()
 )
@@ -3272,11 +3274,11 @@ class App:
 
         # --- Most used words ---
         try:
-            word_re = re.compile(r"[a-zA-Z']+")
+            word_re = re.compile(r"[a-zA-Z'\u2019]+")
             word_counts: dict[str, int] = {}
             for r in all_bodies:  # reuse from emoji section
                 for w in word_re.findall(r[0]):
-                    wl = w.lower().strip("'")
+                    wl = w.lower().replace("'", "").replace("\u2019", "")
                     if len(wl) >= 3 and wl not in _STOP_WORDS:
                         word_counts[wl] = word_counts.get(wl, 0) + 1
             top_words = sorted(word_counts.items(), key=lambda x: -x[1])[:40]
