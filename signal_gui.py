@@ -1590,16 +1590,19 @@ class App:
         search_tab = ttk.Frame(self.nb)
         gallery_tab = ttk.Frame(self.nb)
         export_tab = ttk.Frame(self.nb)
+        stats_tab = ttk.Frame(self.nb)
 
         self.nb.add(build_tab, text="Build DB")
         self.nb.add(search_tab, text="Search & Threads")
         self.nb.add(gallery_tab, text="Media Gallery")
         self.nb.add(export_tab, text="Exports")
+        self.nb.add(stats_tab, text="Stats")
 
         self._build_build_tab(build_tab)
         self._build_search_tab(search_tab)
         self._build_gallery_tab(gallery_tab)
         self._build_exports_tab(export_tab)
+        self._build_stats_tab(stats_tab)
 
         # Restore last selected tab / gallery chat
         try:
@@ -1925,8 +1928,9 @@ class App:
     def _debounced_search(self) -> None:
         self._search_debounce_id = None
         q = (self.q.get() or "").strip()
-        if len(q) < 2:
+        if len(q) == 1:
             return  # Don't search single chars
+        # Allow empty query when filters are set (collected in _collect_params)
         self._run_search(silent=True)
 
     def _on_connect(self) -> None:
@@ -1949,11 +1953,16 @@ class App:
 
     def _collect_params(self, silent: bool = False) -> Optional[SearchParams]:
         q = (self.q.get() or "").strip()
-        if not q:
-            if not silent:
-                messagebox.showwarning("Missing query", "Enter a query.")
-            return None
         recipient = (self.recipient.get() or "").strip() or None
+        has_att = bool(self.filter_has_attachments.get())
+        has_lnk = bool(self.filter_has_links.get())
+        ak = self.attach_kind.get()
+        io = self.inout.get()
+        # Allow empty query when at least one filter is active
+        if not q and not recipient and not has_att and not has_lnk and ak == "any" and io == "any":
+            if not silent:
+                messagebox.showwarning("Missing query", "Enter a query or set at least one filter.")
+            return None
         after = _normalize_date(self.after.get())
         before = _normalize_date(self.before.get())
         if self.after.get().strip() and not after:
@@ -1968,9 +1977,9 @@ class App:
         limit = max(10, min(limit, 20000))
         return SearchParams(
             q=q, recipient=recipient, after=after, before=before, limit=limit,
-            attach_kind=self.attach_kind.get(), inout=self.inout.get(),
-            has_attachments=bool(self.filter_has_attachments.get()),
-            has_links=bool(self.filter_has_links.get()),
+            attach_kind=ak, inout=io,
+            has_attachments=has_att,
+            has_links=has_lnk,
         )
 
     def _run_search(self, silent: bool = False) -> None:
@@ -2015,32 +2024,66 @@ class App:
         if params.has_links:
             has_link_sql = " AND (e.body LIKE '%http://%' OR e.body LIKE '%https://%') "
 
-        if self._has_fts5:
-            sql = f"""
-            SELECT
-                e.message_rowid AS rowid,
-                e.chatId AS chatId,
-                e.dateSentMs AS dateSentMs,
-                e.dateSentIso AS dateSentIso,
-                COALESCE(e.recipientName, '(unknown)') AS recipientName,
-                CASE WHEN e.outgoing = 1 THEN 'OUT' ELSE 'IN' END AS dir,
-                e.outgoing AS outgoing,
-                e.body AS body,
-                f.att_names AS att_names
-            FROM messages_fts f
-            JOIN messages_enriched e ON e.message_rowid = f.rowid
-            WHERE messages_fts MATCH :q
-              {recip_filter_sql}
-              {date_filters}
-              {dir_filter_sql}
-              {kind_filter_sql}
-              {has_att_sql}
-              {has_link_sql}
-            ORDER BY e.dateSentMs DESC
-            LIMIT :limit
-            """
-            binds["q"] = params.q
+        if params.q:
+            # --- Text query present: use FTS5 or LIKE ---
+            if self._has_fts5:
+                sql = f"""
+                SELECT
+                    e.message_rowid AS rowid,
+                    e.chatId AS chatId,
+                    e.dateSentMs AS dateSentMs,
+                    e.dateSentIso AS dateSentIso,
+                    COALESCE(e.recipientName, '(unknown)') AS recipientName,
+                    CASE WHEN e.outgoing = 1 THEN 'OUT' ELSE 'IN' END AS dir,
+                    e.outgoing AS outgoing,
+                    e.body AS body,
+                    f.att_names AS att_names
+                FROM messages_fts f
+                JOIN messages_enriched e ON e.message_rowid = f.rowid
+                WHERE messages_fts MATCH :q
+                  {recip_filter_sql}
+                  {date_filters}
+                  {dir_filter_sql}
+                  {kind_filter_sql}
+                  {has_att_sql}
+                  {has_link_sql}
+                ORDER BY e.dateSentMs DESC
+                LIMIT :limit
+                """
+                binds["q"] = params.q
+            else:
+                sql = f"""
+                SELECT
+                    e.message_rowid AS rowid,
+                    e.chatId AS chatId,
+                    e.dateSentMs AS dateSentMs,
+                    e.dateSentIso AS dateSentIso,
+                    COALESCE(e.recipientName, '(unknown)') AS recipientName,
+                    CASE WHEN e.outgoing = 1 THEN 'OUT' ELSE 'IN' END AS dir,
+                    e.outgoing AS outgoing,
+                    e.body AS body,
+                    COALESCE((
+                        SELECT group_concat(a.file_name, ' ')
+                        FROM attachments a
+                        WHERE a.message_rowid = e.message_rowid AND a.file_name != ''
+                    ), '') AS att_names
+                FROM messages_enriched e
+                WHERE (
+                    (e.body IS NOT NULL AND lower(e.body) LIKE :q)
+                    OR EXISTS (SELECT 1 FROM attachments a WHERE a.message_rowid = e.message_rowid AND lower(a.file_name) LIKE :q)
+                )
+                  {recip_filter_sql}
+                  {date_filters}
+                  {dir_filter_sql}
+                  {kind_filter_sql}
+                  {has_att_sql}
+                  {has_link_sql}
+                ORDER BY e.dateSentMs DESC
+                LIMIT :limit
+                """
+                binds["q"] = f"%{params.q.lower()}%"
         else:
+            # --- No text query: filter-only browse ---
             sql = f"""
             SELECT
                 e.message_rowid AS rowid,
@@ -2057,10 +2100,7 @@ class App:
                     WHERE a.message_rowid = e.message_rowid AND a.file_name != ''
                 ), '') AS att_names
             FROM messages_enriched e
-            WHERE (
-                (e.body IS NOT NULL AND lower(e.body) LIKE :q)
-                OR EXISTS (SELECT 1 FROM attachments a WHERE a.message_rowid = e.message_rowid AND lower(a.file_name) LIKE :q)
-            )
+            WHERE 1=1
               {recip_filter_sql}
               {date_filters}
               {dir_filter_sql}
@@ -2070,7 +2110,6 @@ class App:
             ORDER BY e.dateSentMs DESC
             LIMIT :limit
             """
-            binds["q"] = f"%{params.q.lower()}%"
 
         try:
             self._search_rows = [dict(r) for r in self._conn.execute(sql, binds).fetchall()]
@@ -2778,6 +2817,219 @@ class App:
 
         self.export_status = tk.StringVar(value="")
         ttk.Label(outer, textvariable=self.export_status).pack(anchor="w", pady=(12, 0))
+
+    # ---------- Stats tab ----------
+
+    def _build_stats_tab(self, parent: ttk.Frame) -> None:
+        outer = ttk.Frame(parent, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(outer)
+        top.pack(fill=tk.X)
+        ttk.Button(top, text="Refresh Stats", command=self._refresh_stats).pack(side=tk.LEFT)
+        self._stats_status = tk.StringVar(value="Click Refresh Stats after connecting to a database.")
+        ttk.Label(top, textvariable=self._stats_status).pack(side=tk.LEFT, padx=12)
+
+        container = ttk.Frame(outer)
+        container.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self._stats_text = tk.Text(container, wrap="word", state="disabled")
+        sv = ttk.Scrollbar(container, orient="vertical", command=self._stats_text.yview)
+        self._stats_text.configure(yscrollcommand=sv.set)
+        self._stats_text.grid(row=0, column=0, sticky="nsew")
+        sv.grid(row=0, column=1, sticky="ns")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+        self._apply_theme_to_text(self._stats_text)
+        _bind_mousewheel(self._stats_text)
+
+    def _refresh_stats(self) -> None:
+        if self._conn is None and not self._connect():
+            return
+        assert self._conn is not None
+        self._stats_status.set("Loading stats…")
+        self.root.update_idletasks()
+
+        conn = self._conn
+        lines: list[str] = []
+
+        def _q1(sql: str) -> Any:
+            try:
+                return conn.execute(sql).fetchone()[0]
+            except Exception:
+                return None
+
+        def _qall(sql: str) -> list:
+            try:
+                return conn.execute(sql).fetchall()
+            except Exception:
+                return []
+
+        # --- Overview ---
+        db_path = Path(self.db_path.get()).expanduser()
+        db_size = _human_size(db_path.stat().st_size) if db_path.exists() else "?"
+        msg_count = _q1("SELECT COUNT(*) FROM messages") or 0
+        chat_count = _q1("SELECT COUNT(*) FROM chats") or 0
+        att_count = _q1("SELECT COUNT(*) FROM attachments") or 0
+        att_resolved = _q1("SELECT COUNT(*) FROM attachments WHERE abs_path != ''") or 0
+        recip_count = _q1("SELECT COUNT(*) FROM recipients") or 0
+        outgoing = _q1("SELECT COUNT(*) FROM messages WHERE outgoing = 1") or 0
+        incoming = msg_count - outgoing
+
+        lines.append("═══════════════ DATABASE OVERVIEW ═══════════════")
+        lines.append(f"  Database file:       {db_path.name}  ({db_size})")
+        lines.append(f"  Conversations:       {chat_count:,}")
+        lines.append(f"  Recipients:          {recip_count:,}")
+        lines.append(f"  Total messages:      {msg_count:,}")
+        lines.append(f"    Sent (outgoing):   {outgoing:,}  ({outgoing*100/msg_count:.1f}%)" if msg_count else "    Sent: 0")
+        lines.append(f"    Received (incoming):{incoming:,}  ({incoming*100/msg_count:.1f}%)" if msg_count else "    Received: 0")
+        lines.append(f"  Total attachments:   {att_count:,}")
+        att_pct = f"{att_resolved*100/att_count:.1f}%" if att_count else "n/a"
+        lines.append(f"    Resolved (on disk): {att_resolved:,}  ({att_pct})")
+        lines.append("")
+
+        # --- Date range ---
+        first_date = _q1("SELECT MIN(dateSentIso) FROM messages WHERE dateSentIso IS NOT NULL")
+        last_date = _q1("SELECT MAX(dateSentIso) FROM messages WHERE dateSentIso IS NOT NULL")
+        if first_date and last_date:
+            lines.append("═══════════════ DATE RANGE ═══════════════")
+            lines.append(f"  First message:  {first_date[:19]}")
+            lines.append(f"  Last message:   {last_date[:19]}")
+            try:
+                d1 = datetime.fromisoformat(first_date)
+                d2 = datetime.fromisoformat(last_date)
+                span = (d2 - d1).days
+                lines.append(f"  Span:           {span:,} days  ({span/365.25:.1f} years)")
+                if msg_count and span > 0:
+                    lines.append(f"  Avg msgs/day:   {msg_count/span:.1f}")
+            except Exception:
+                pass
+            lines.append("")
+
+        # --- Messages per month (top 12) ---
+        monthly = _qall("""
+            SELECT substr(dateSentIso, 1, 7) AS month, COUNT(*) AS cnt
+            FROM messages WHERE dateSentIso IS NOT NULL
+            GROUP BY month ORDER BY cnt DESC LIMIT 12
+        """)
+        if monthly:
+            lines.append("═══════════════ BUSIEST MONTHS (top 12) ═══════════════")
+            max_cnt = monthly[0][1] if monthly else 1
+            for r in monthly:
+                bar_len = int(r[1] / max_cnt * 30)
+                lines.append(f"  {r[0]}  {'█' * bar_len}  {r[1]:,}")
+            lines.append("")
+
+        # --- Top 15 conversations by message count ---
+        top_chats = _qall("""
+            SELECT e.chatId, COALESCE(e.recipientName, '(unknown)') AS name,
+                   COUNT(*) AS cnt
+            FROM messages_enriched e
+            GROUP BY e.chatId
+            ORDER BY cnt DESC LIMIT 15
+        """)
+        if top_chats:
+            lines.append("═══════════════ TOP 15 CONVERSATIONS ═══════════════")
+            max_cnt = top_chats[0][2] if top_chats else 1
+            for r in top_chats:
+                bar_len = int(r[2] / max_cnt * 30)
+                lines.append(f"  {r[1][:28]:<28}  {'█' * bar_len}  {r[2]:,}  (chat {r[0]})")
+            lines.append("")
+
+        # --- Attachment breakdown by kind ---
+        att_kinds = _qall("""
+            SELECT COALESCE(kind, '(none)') AS k, COUNT(*) AS cnt,
+                   SUM(COALESCE(size_bytes, 0)) AS total_bytes
+            FROM attachments GROUP BY k ORDER BY cnt DESC
+        """)
+        if att_kinds:
+            lines.append("═══════════════ ATTACHMENTS BY TYPE ═══════════════")
+            for r in att_kinds:
+                sz = _human_size(r[2]) if r[2] else "0 B"
+                lines.append(f"  {r[0]:<10}  {r[1]:>7,} files   {sz:>10}")
+            total_size = sum(r[2] or 0 for r in att_kinds)
+            lines.append(f"  {'TOTAL':<10}  {att_count:>7,} files   {_human_size(total_size):>10}")
+            lines.append("")
+
+        # --- Top 10 file types by count ---
+        top_mime = _qall("""
+            SELECT COALESCE(mime, '(unknown)') AS m, COUNT(*) AS cnt
+            FROM attachments WHERE mime IS NOT NULL AND mime != ''
+            GROUP BY m ORDER BY cnt DESC LIMIT 10
+        """)
+        if top_mime:
+            lines.append("═══════════════ TOP 10 MIME TYPES ═══════════════")
+            for r in top_mime:
+                lines.append(f"  {r[0]:<40}  {r[1]:,}")
+            lines.append("")
+
+        # --- Largest attachments ---
+        big_files = _qall("""
+            SELECT file_name, size_bytes, kind, mime
+            FROM attachments WHERE size_bytes IS NOT NULL
+            ORDER BY size_bytes DESC LIMIT 10
+        """)
+        if big_files:
+            lines.append("═══════════════ LARGEST FILES ═══════════════")
+            for r in big_files:
+                fn = (r[0] or "(unnamed)")[:40]
+                lines.append(f"  {_human_size(r[1]):>10}  {r[2] or '?':<8}  {fn}")
+            lines.append("")
+
+        # --- Day of week distribution ---
+        dow = _qall("""
+            SELECT
+                CASE CAST(strftime('%w', dateSentIso) AS INTEGER)
+                    WHEN 0 THEN 'Sun' WHEN 1 THEN 'Mon' WHEN 2 THEN 'Tue'
+                    WHEN 3 THEN 'Wed' WHEN 4 THEN 'Thu' WHEN 5 THEN 'Fri'
+                    WHEN 6 THEN 'Sat' END AS day_name,
+                COUNT(*) AS cnt
+            FROM messages WHERE dateSentIso IS NOT NULL
+            GROUP BY strftime('%w', dateSentIso)
+            ORDER BY strftime('%w', dateSentIso)
+        """)
+        if dow:
+            lines.append("═══════════════ MESSAGES BY DAY OF WEEK ═══════════════")
+            max_cnt = max(r[1] for r in dow) if dow else 1
+            for r in dow:
+                bar_len = int(r[1] / max_cnt * 30)
+                lines.append(f"  {r[0]}  {'█' * bar_len}  {r[1]:,}")
+            lines.append("")
+
+        # --- Hour of day distribution ---
+        hod = _qall("""
+            SELECT CAST(strftime('%H', dateSentIso) AS INTEGER) AS hr, COUNT(*) AS cnt
+            FROM messages WHERE dateSentIso IS NOT NULL
+            GROUP BY hr ORDER BY hr
+        """)
+        if hod:
+            lines.append("═══════════════ MESSAGES BY HOUR (UTC) ═══════════════")
+            max_cnt = max(r[1] for r in hod) if hod else 1
+            for r in hod:
+                bar_len = int(r[1] / max_cnt * 30)
+                lines.append(f"  {r[0]:02d}:00  {'█' * bar_len}  {r[1]:,}")
+            lines.append("")
+
+        # --- Messages with links ---
+        link_count = _q1("SELECT COUNT(*) FROM messages WHERE body LIKE '%http://%' OR body LIKE '%https://%'") or 0
+        if msg_count:
+            lines.append("═══════════════ EXTRAS ═══════════════")
+            lines.append(f"  Messages containing links:  {link_count:,}  ({link_count*100/msg_count:.1f}%)")
+            msgs_with_att = _q1("SELECT COUNT(DISTINCT message_rowid) FROM attachments") or 0
+            lines.append(f"  Messages with attachments:  {msgs_with_att:,}  ({msgs_with_att*100/msg_count:.1f}%)")
+            avg_len = _q1("SELECT AVG(LENGTH(body)) FROM messages WHERE body IS NOT NULL AND body != ''")
+            if avg_len:
+                lines.append(f"  Avg message length:         {avg_len:.0f} chars")
+            longest = _q1("SELECT MAX(LENGTH(body)) FROM messages")
+            if longest:
+                lines.append(f"  Longest message:            {longest:,} chars")
+            lines.append("")
+
+        report = "\n".join(lines)
+        self._stats_text.configure(state="normal")
+        self._stats_text.delete("1.0", tk.END)
+        self._stats_text.insert("1.0", report)
+        self._stats_text.configure(state="disabled")
+        self._stats_status.set(f"Stats loaded — {msg_count:,} messages, {chat_count:,} chats")
 
     def _export_search_csv(self) -> None:
         if not self._search_rows:
