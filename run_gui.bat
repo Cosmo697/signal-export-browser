@@ -1,9 +1,11 @@
 @echo off
 setlocal
+title Signal Export Browser
 if not exist .venv (
-  python -m venv .venv
+    echo Virtual environment not found. Running setup first...
+    call setup.bat
+    exit /b
 )
 call .venv\Scripts\activate.bat
-python -m pip install -r requirements.txt
 python signal_gui.py
 pause
