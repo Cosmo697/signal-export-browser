@@ -44,8 +44,10 @@ from PIL import Image, ImageTk, ImageDraw, ImageFont
 
 import build_signal_db
 
-# Common English stop words to exclude from word frequency / word cloud
+# Stop words: NLTK English (179) + contractions + common chat filler.
+# Source: nltk.corpus.stopwords.words("english") — bundled here to avoid the dependency.
 _STOP_WORDS: frozenset[str] = frozenset(
+    # --- NLTK standard 179 ---
     "i me my myself we our ours ourselves you your yours yourself yourselves "
     "he him his himself she her hers herself it its itself they them their "
     "theirs themselves what which who whom this that these those am is are was "
@@ -56,14 +58,35 @@ _STOP_WORDS: frozenset[str] = frozenset(
     "both each few more most other some such no nor not only own same so than "
     "too very s t can will just don should now d ll m o re ve y ain aren "
     "couldn didn doesn hadn hasn haven isn ma mightn mustn needn shan shouldn "
-    "wasn weren won wouldn could would might must shall also got get still "
-    "really like yeah yes ok okay oh hey hi hello right well much back "
-    "going one go see know think even way want going things thing just "
-    "im thats dont cant didnt youre ill ive youve theyre wont hes shes "
-    "its theres whats lets wouldnt couldnt shouldnt wasnt werent isnt "
-    "arent hasnt havent hadnt whos thats wheres heres theres whens whys hows "
-    "something anything nothing everything someone anyone everyone "
-    "lol haha lmao omg idk gonna wanna ya yea nah "
+    "wasn weren won wouldn could would might must shall "
+    # --- Common contractions (written without apostrophes as the tokeniser strips them) ---
+    "im youre hes shes its were theyre ive youve weve theyve "
+    "ill youll hell shell well theyll isnt arent wasnt werent "
+    "hasnt havent hadnt doesnt dont didnt wont wouldnt shant shouldnt "
+    "cant cannot couldnt mustnt lets thats whos whats heres theres "
+    "wheres whens whys hows aint "
+    # --- Extra very-common English words not in NLTK ---
+    "also got get getting gets still really actually already always "
+    "never ever since much many way back new old make made makes making "
+    "take took takes taking come came comes coming give gave gives giving "
+    "think thought thinks thinking know knew knows knowing look looked looks "
+    "looking want wanted wants wanting say said says saying tell told tells "
+    "telling try tried tries trying use used uses using find found finds "
+    "need needed needs needing feel felt feels feeling leave left leaves "
+    "call called calls put keep keeps kept let run going gone went "
+    "even though another thing things people time day good first "
+    "last long great little own big small right well next around "
+    "work may part something anything nothing everything someone anyone "
+    "everyone two one three four five six seven eight nine ten "
+    "see saw seen hear heard lot sure enough kind "
+    # --- Chat / texting filler ---
+    "like yeah yes yep yup nope nah ok okay lol haha hahaha hehe "
+    "lmao lmfao omg omfg idk tbh imo imho btw brb ttyl "
+    "gonna wanna gotta kinda sorta ya yea hey hi hello "
+    "bye thanks thank please sorry wow oh ooh ahh hmm umm "
+    "maybe probably definitely literally actually basically seriously "
+    "pretty really just like well anyway "
+    # --- URL fragments ---
     "http https www com org net".split()
 )
 
