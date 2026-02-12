@@ -139,7 +139,7 @@ def _normalize_date(s: str) -> str | None:
 
 
 def _fmt_ts_short(iso: str) -> str:
-    """Format an ISO timestamp as YYMMDD-HH:MM:SS (24h)."""
+    """Format an ISO timestamp as YYMMDD-HH:MM:SS in local time (24h)."""
     s = (iso or "").strip()
     if not s:
         return ""
@@ -149,8 +149,35 @@ def _fmt_ts_short(iso: str) -> str:
             s = s[:-1] + "+00:00"
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is not None:
-            dt = dt.astimezone(timezone.utc)
+            # Convert aware timestamps to local timezone.
+            dt = dt.astimezone()
         return dt.strftime("%y%m%d-%H:%M:%S")
+    except Exception:
+        return iso
+
+
+def _fmt_ts_local_iso(iso: str, ms: Any = None) -> str:
+    """Format a message timestamp as a local-time ISO string (seconds precision).
+
+    Prefers *ms* (epoch milliseconds) when provided; falls back to parsing *iso*.
+    """
+    if ms is not None:
+        try:
+            dt = datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc).astimezone()
+            return dt.isoformat(timespec="seconds")
+        except Exception:
+            pass
+
+    s = (iso or "").strip()
+    if not s:
+        return ""
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.isoformat(timespec="seconds") if hasattr(dt, "isoformat") else str(dt)
     except Exception:
         return iso
 
@@ -448,6 +475,26 @@ class App:
 
         self._make_ui()
         self._apply_theme_now()
+
+    def _resolve_font_spec(self, spec: str, fallback: str) -> str:
+        """Resolve a theme font spec into an installed font family.
+
+        Supports a simple fallback list separated by '|', e.g.
+        'Roboto|Segoe UI|Arial'. Returns the first installed family.
+        """
+        spec = (spec or "").strip()
+        if not spec:
+            return fallback
+        if "|" not in spec:
+            return spec
+        try:
+            installed = set(tkfont.families(self.root))
+        except Exception:
+            installed = set()
+        for cand in [p.strip() for p in spec.split("|") if p.strip()]:
+            if not installed or cand in installed:
+                return cand
+        return fallback
 
     def _default_theme(self) -> Dict[str, Any]:
         return {
@@ -781,9 +828,15 @@ class App:
                 return v.strip()
             return default
 
-        # Fonts
-        base["font_family"] = _as_str(base.get("font_family"), "Segoe UI")
-        base["mono_family"] = _as_str(base.get("mono_family"), "Consolas")
+        # Fonts (support fallback specs separated by '|')
+        base["font_family"] = self._resolve_font_spec(
+            _as_str(base.get("font_family"), "Segoe UI"),
+            "Segoe UI",
+        )
+        base["mono_family"] = self._resolve_font_spec(
+            _as_str(base.get("mono_family"), "Consolas"),
+            "Consolas",
+        )
 
         # Sizes (keep font_size as UI size for older saved themes)
         ui_size = _as_int(base.get("ui_size"), _as_int(base.get("font_size"), 10))
@@ -845,150 +898,167 @@ class App:
     def _theme_presets(self) -> Dict[str, Dict[str, Any]]:
         base = self._default_theme()
         return {
-            "Light (Default)": dict(base),
-            "Light (Soft)": {
+            # Stock presets: popular app-inspired palettes.
+            # Keep an equal number of light and dark themes.
+            "GitHub Light": {
                 **base,
-                "meta_fg": "#5a5a5a",
-                "hit_bg": "#ffe7b3",
-                "term_bg": "#e3f6ff",
-                "link_fg": "#005fb8",
-            },
-            "Graphite and Gold": {
-                **base,
-                "font_family": "Segoe UI",
-                "font_size": 10,
-                "ui_size": 10,
-                "text_size": 10,
-                "heading_size": 11,
-                "mono_family": "Consolas",
-                "mono_size": 10,
-                "app_bg": "#1f2023",
-                "panel_bg": "#2a2c31",
-                "widget_bg": "#32343a",
-                "widget_fg": "#f2f2f2",
-                "select_bg": "#b08d15",
-                "select_fg": "#111111",
-                "accent": "#d4af37",
-                "text_bg": "#1f2023",
-                "text_fg": "#f2f2f2",
-                "meta_fg": "#bdbdbd",
-                "you_fg": "#d4af37",
-                "them_fg": "#f2f2f2",
-                "hit_bg": "#5a4b00",
-                "term_bg": "#3a3b40",
-                "link_fg": "#ffd76a",
-            },
-            "Fascist": {
-                **base,
-                "font_family": "Segoe UI",
-                "font_size": 10,
-                "ui_size": 10,
-                "text_size": 10,
-                "heading_size": 11,
-                "mono_family": "Consolas",
-                "mono_size": 10,
-                "app_bg": "#141414",
-                "panel_bg": "#1c1c1c",
-                "widget_bg": "#222222",
-                "widget_fg": "#f2f2f2",
-                "select_bg": "#6b0000",
+                "font_family": "-apple-system|Segoe UI|Inter|Arial",
+                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
+                "app_bg": "#f6f8fa",
+                "panel_bg": "#ffffff",
+                "widget_bg": "#ffffff",
+                "widget_fg": "#24292f",
+                "select_bg": "#0969da",
                 "select_fg": "#ffffff",
-                "accent": "#b30000",
-                "text_bg": "#141414",
-                "text_fg": "#f2f2f2",
-                "meta_fg": "#b0b0b0",
-                "you_fg": "#ff4d4d",
-                "them_fg": "#f2f2f2",
-                "hit_bg": "#4d1a1a",
-                "term_bg": "#2a0f0f",
-                "link_fg": "#ff8080",
+                "accent": "#0969da",
+                "text_bg": "#ffffff",
+                "text_fg": "#24292f",
+                "meta_fg": "#57606a",
+                "you_fg": "#0969da",
+                "them_fg": "#1a7f37",
+                "hit_bg": "#fff8c5",
+                "term_bg": "#ddf4ff",
+                "link_fg": "#0969da",
             },
-            "Terminal": {
+            "Google Light": {
                 **base,
-                "font_family": "Cascadia Mono",
-                "font_size": 10,
-                "ui_size": 10,
-                "text_size": 10,
-                "heading_size": 11,
-                "mono_family": "Cascadia Mono",
-                "mono_size": 10,
-                # Terminal palette inspiration: Dracula (multi-accent).
-                "app_bg": "#282a36",
-                "panel_bg": "#282a36",
-                "widget_bg": "#44475a",
-                "widget_fg": "#f8f8f2",
-                "select_bg": "#44475a",
-                "select_fg": "#f8f8f2",
-                "accent": "#bd93f9",
-                "text_bg": "#282a36",
-                "text_fg": "#f8f8f2",
-                "meta_fg": "#6272a4",
-                "you_fg": "#ff79c6",
-                "them_fg": "#50fa7b",
-                "hit_bg": "#ffb86c",
-                "term_bg": "#6272a4",
-                "link_fg": "#8be9fd",
-            },
-            "Saphire": {
-                **base,
-                "font_family": "Segoe UI",
-                "font_size": 10,
-                "ui_size": 10,
-                "text_size": 10,
-                "heading_size": 11,
-                "mono_family": "Consolas",
-                "mono_size": 10,
-                "app_bg": "#071a33",
-                "panel_bg": "#0b2347",
-                "widget_bg": "#0f2d5c",
-                "widget_fg": "#e6edf3",
-                "select_bg": "#2f81f7",
+                "font_family": "Roboto|Segoe UI|Arial",
+                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
+                "app_bg": "#f1f3f4",
+                "panel_bg": "#ffffff",
+                "widget_bg": "#ffffff",
+                "widget_fg": "#202124",
+                "select_bg": "#1a73e8",
                 "select_fg": "#ffffff",
-                "accent": "#2f81f7",
-                "text_bg": "#071a33",
-                "text_fg": "#e6edf3",
-                "meta_fg": "#9fb4d0",
-                "you_fg": "#79c0ff",
-                "them_fg": "#a5d6ff",
-                "hit_bg": "#1f4b7a",
-                "term_bg": "#103a63",
-                "link_fg": "#a5d6ff",
+                "accent": "#1a73e8",
+                "text_bg": "#ffffff",
+                "text_fg": "#202124",
+                "meta_fg": "#5f6368",
+                "you_fg": "#1a73e8",
+                "them_fg": "#34a853",
+                "hit_bg": "#fff8e1",
+                "term_bg": "#e8f0fe",
+                "link_fg": "#1a73e8",
             },
-            "Dark (Slate)": {
+            "Slack Light": {
                 **base,
-                "app_bg": "#1b1b1b",
-                "panel_bg": "#1e1e1e",
-                "widget_bg": "#252526",
-                "widget_fg": "#d4d4d4",
-                "select_bg": "#264f78",
+                "font_family": "Lato|Segoe UI|Arial",
+                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
+                "app_bg": "#f8f8f8",
+                "panel_bg": "#ffffff",
+                "widget_bg": "#ffffff",
+                "widget_fg": "#1d1c1d",
+                "select_bg": "#4a154b",
                 "select_fg": "#ffffff",
-                "accent": "#7cb7ff",
-                "text_bg": "#1e1e1e",
-                "text_fg": "#d4d4d4",
-                "meta_fg": "#9aa0a6",
-                "you_fg": "#7cb7ff",
-                "them_fg": "#7ee787",
-                "hit_bg": "#5a4b00",
-                "term_bg": "#00384d",
-                "link_fg": "#caa9ff",
+                "accent": "#4a154b",
+                "text_bg": "#ffffff",
+                "text_fg": "#1d1c1d",
+                "meta_fg": "#616061",
+                "you_fg": "#4a154b",
+                "them_fg": "#2eb67d",
+                "hit_bg": "#fff3c4",
+                "term_bg": "#e6f7ff",
+                "link_fg": "#36c5f0",
             },
-            "Dark (Midnight)": {
+            "Apple Notes Light": {
                 **base,
-                "app_bg": "#0b1220",
-                "panel_bg": "#0f172a",
-                "widget_bg": "#111c33",
-                "widget_fg": "#e6edf3",
+                "font_family": "SF Pro Text|Segoe UI|Arial",
+                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
+                "app_bg": "#f5f2ea",
+                "panel_bg": "#fffdf8",
+                "widget_bg": "#fffdf8",
+                "widget_fg": "#1f2328",
+                "select_bg": "#ffd60a",
+                "select_fg": "#1f2328",
+                "accent": "#ff9f0a",
+                "text_bg": "#fffdf8",
+                "text_fg": "#1f2328",
+                "meta_fg": "#6e6e73",
+                "you_fg": "#0a84ff",
+                "them_fg": "#34c759",
+                "hit_bg": "#ffefb0",
+                "term_bg": "#e9f5ff",
+                "link_fg": "#0a84ff",
+            },
+            "GitHub Dark": {
+                **base,
+                "font_family": "-apple-system|Segoe UI|Inter|Arial",
+                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
+                "app_bg": "#0d1117",
+                "panel_bg": "#161b22",
+                "widget_bg": "#21262d",
+                "widget_fg": "#c9d1d9",
                 "select_bg": "#1f6feb",
                 "select_fg": "#ffffff",
-                "accent": "#79c0ff",
-                "text_bg": "#0b1220",
-                "text_fg": "#e6edf3",
-                "meta_fg": "#9aa4b2",
-                "you_fg": "#79c0ff",
-                "them_fg": "#56d364",
+                "accent": "#1f6feb",
+                "text_bg": "#0d1117",
+                "text_fg": "#c9d1d9",
+                "meta_fg": "#8b949e",
+                "you_fg": "#58a6ff",
+                "them_fg": "#3fb950",
                 "hit_bg": "#5a3b00",
                 "term_bg": "#003049",
-                "link_fg": "#d2a8ff",
+                "link_fg": "#a371f7",
+            },
+            "Discord Dark": {
+                **base,
+                "font_family": "gg sans|Whitney|Segoe UI|Arial",
+                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
+                "app_bg": "#1e1f22",
+                "panel_bg": "#2b2d31",
+                "widget_bg": "#313338",
+                "widget_fg": "#dbdee1",
+                "select_bg": "#5865f2",
+                "select_fg": "#ffffff",
+                "accent": "#5865f2",
+                "text_bg": "#2b2d31",
+                "text_fg": "#dbdee1",
+                "meta_fg": "#949ba4",
+                "you_fg": "#5865f2",
+                "them_fg": "#3ba55d",
+                "hit_bg": "#4f3b00",
+                "term_bg": "#22303c",
+                "link_fg": "#00a8fc",
+            },
+            "Spotify Dark": {
+                **base,
+                "font_family": "Circular Spotify|Circular|Segoe UI|Arial",
+                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
+                "app_bg": "#121212",
+                "panel_bg": "#181818",
+                "widget_bg": "#242424",
+                "widget_fg": "#ffffff",
+                "select_bg": "#1db954",
+                "select_fg": "#000000",
+                "accent": "#1db954",
+                "text_bg": "#121212",
+                "text_fg": "#ffffff",
+                "meta_fg": "#b3b3b3",
+                "you_fg": "#1db954",
+                "them_fg": "#1ed760",
+                "hit_bg": "#3a2a00",
+                "term_bg": "#003322",
+                "link_fg": "#1db954",
+            },
+            "X Dark": {
+                **base,
+                "font_family": "TwitterChirp|Segoe UI|Arial",
+                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
+                "app_bg": "#000000",
+                "panel_bg": "#0a0a0a",
+                "widget_bg": "#16181c",
+                "widget_fg": "#e7e9ea",
+                "select_bg": "#1d9bf0",
+                "select_fg": "#ffffff",
+                "accent": "#1d9bf0",
+                "text_bg": "#000000",
+                "text_fg": "#e7e9ea",
+                "meta_fg": "#71767b",
+                "you_fg": "#1d9bf0",
+                "them_fg": "#00ba7c",
+                "hit_bg": "#2f2a00",
+                "term_bg": "#001d2a",
+                "link_fg": "#1d9bf0",
             },
         }
 
@@ -2191,7 +2261,7 @@ class App:
 
         ttk.Label(mid, text="Hits in selected conversation").pack(anchor="w")
         self.hit_tree = ttk.Treeview(mid, columns=("date", "dir", "snippet", "rowid"), show="headings", height=20)
-        self.hit_tree.heading("date", text="Date (UTC)")
+        self.hit_tree.heading("date", text="Date (Local)")
         self.hit_tree.heading("dir", text="Dir")
         self.hit_tree.heading("snippet", text="Snippet")
         self.hit_tree.heading("rowid", text="RowID")
@@ -2324,10 +2394,10 @@ class App:
 
         date_filters = ""
         if params.after:
-            date_filters += " AND date(e.dateSentIso) >= date(:after) "
+            date_filters += " AND date(e.dateSentMs / 1000, 'unixepoch', 'localtime') >= date(:after) "
             binds["after"] = params.after
         if params.before:
-            date_filters += " AND date(e.dateSentIso) <= date(:before) "
+            date_filters += " AND date(e.dateSentMs / 1000, 'unixepoch', 'localtime') <= date(:before) "
             binds["before"] = params.before
 
         dir_filter_sql = ""
@@ -3313,16 +3383,22 @@ class App:
         lines.append(f"    Resolved (on disk): {att_resolved:,}  ({att_pct})")
         lines.append("")
 
-        # --- Date range ---
-        first_date = _q1("SELECT MIN(dateSentIso) FROM messages WHERE dateSentIso IS NOT NULL")
-        last_date = _q1("SELECT MAX(dateSentIso) FROM messages WHERE dateSentIso IS NOT NULL")
+        # --- Date range (LOCAL TIME) ---
+        first_date = _q1("""
+            SELECT MIN(datetime(dateSentMs / 1000, 'unixepoch', 'localtime'))
+            FROM messages WHERE dateSentMs IS NOT NULL
+        """)
+        last_date = _q1("""
+            SELECT MAX(datetime(dateSentMs / 1000, 'unixepoch', 'localtime'))
+            FROM messages WHERE dateSentMs IS NOT NULL
+        """)
         if first_date and last_date:
             lines.append("═══════════════ DATE RANGE ═══════════════")
-            lines.append(f"  First message:  {first_date[:19]}")
-            lines.append(f"  Last message:   {last_date[:19]}")
+            lines.append(f"  First message:  {str(first_date)[:19]}")
+            lines.append(f"  Last message:   {str(last_date)[:19]}")
             try:
-                d1 = datetime.fromisoformat(first_date)
-                d2 = datetime.fromisoformat(last_date)
+                d1 = datetime.fromisoformat(str(first_date))
+                d2 = datetime.fromisoformat(str(last_date))
                 span = (d2 - d1).days
                 lines.append(f"  Span:           {span:,} days  ({span/365.25:.1f} years)")
                 if msg_count and span > 0:
@@ -3331,10 +3407,11 @@ class App:
                 pass
             lines.append("")
 
-        # --- Messages per month (top 12) ---
+        # --- Messages per month (top 12, LOCAL TIME) ---
         monthly = _qall("""
-            SELECT substr(dateSentIso, 1, 7) AS month, COUNT(*) AS cnt
-            FROM messages WHERE dateSentIso IS NOT NULL
+            SELECT strftime('%Y-%m', dateSentMs / 1000, 'unixepoch', 'localtime') AS month,
+                   COUNT(*) AS cnt
+            FROM messages WHERE dateSentMs IS NOT NULL
             GROUP BY month ORDER BY cnt DESC LIMIT 12
         """)
         if monthly:
@@ -3404,14 +3481,14 @@ class App:
         # --- Day of week distribution ---
         dow = _qall("""
             SELECT
-                CASE CAST(strftime('%w', dateSentIso) AS INTEGER)
+                CASE CAST(strftime('%w', dateSentMs / 1000, 'unixepoch', 'localtime') AS INTEGER)
                     WHEN 0 THEN 'Sun' WHEN 1 THEN 'Mon' WHEN 2 THEN 'Tue'
                     WHEN 3 THEN 'Wed' WHEN 4 THEN 'Thu' WHEN 5 THEN 'Fri'
                     WHEN 6 THEN 'Sat' END AS day_name,
                 COUNT(*) AS cnt
-            FROM messages WHERE dateSentIso IS NOT NULL
-            GROUP BY strftime('%w', dateSentIso)
-            ORDER BY strftime('%w', dateSentIso)
+            FROM messages WHERE dateSentMs IS NOT NULL
+            GROUP BY strftime('%w', dateSentMs / 1000, 'unixepoch', 'localtime')
+            ORDER BY strftime('%w', dateSentMs / 1000, 'unixepoch', 'localtime')
         """)
         if dow:
             lines.append("═══════════════ MESSAGES BY DAY OF WEEK ═══════════════")
@@ -3421,14 +3498,17 @@ class App:
                 lines.append(f"  {r[0]}  {'█' * bar_len}  {r[1]:,}")
             lines.append("")
 
-        # --- Hour of day distribution ---
+        # --- Hour of day distribution (LOCAL TIME) ---
+        # Use epoch milliseconds and SQLite's 'localtime' modifier so this reflects
+        # the user's machine timezone (including DST where applicable).
         hod = _qall("""
-            SELECT CAST(strftime('%H', dateSentIso) AS INTEGER) AS hr, COUNT(*) AS cnt
-            FROM messages WHERE dateSentIso IS NOT NULL
+            SELECT CAST(strftime('%H', dateSentMs / 1000, 'unixepoch', 'localtime') AS INTEGER) AS hr,
+                   COUNT(*) AS cnt
+            FROM messages WHERE dateSentMs IS NOT NULL
             GROUP BY hr ORDER BY hr
         """)
         if hod:
-            lines.append("═══════════════ MESSAGES BY HOUR (UTC) ═══════════════")
+            lines.append("═══════════════ MESSAGES BY HOUR (LOCAL) ═══════════════")
             max_cnt = max(r[1] for r in hod) if hod else 1
             for r in hod:
                 bar_len = int(r[1] / max_cnt * 30)
@@ -3485,8 +3565,8 @@ class App:
         # --- Longest streaks (consecutive days with messages) ---
         try:
             day_rows = _qall("""
-                SELECT DISTINCT date(dateSentIso) AS d
-                FROM messages WHERE dateSentIso IS NOT NULL
+                SELECT DISTINCT date(dateSentMs / 1000, 'unixepoch', 'localtime') AS d
+                FROM messages WHERE dateSentMs IS NOT NULL
                 ORDER BY d
             """)
             if day_rows:
@@ -3638,10 +3718,11 @@ class App:
         except Exception:
             pass
 
-        # --- Yearly message volume ---
+        # --- Yearly message volume (LOCAL TIME) ---
         yearly = _qall("""
-            SELECT substr(dateSentIso, 1, 4) AS yr, COUNT(*) AS cnt
-            FROM messages WHERE dateSentIso IS NOT NULL
+            SELECT strftime('%Y', dateSentMs / 1000, 'unixepoch', 'localtime') AS yr,
+                   COUNT(*) AS cnt
+            FROM messages WHERE dateSentMs IS NOT NULL
             GROUP BY yr ORDER BY yr
         """)
         if yearly and len(yearly) > 1:
@@ -3815,7 +3896,10 @@ class App:
                 w = csv.DictWriter(f, fieldnames=fields)
                 w.writeheader()
                 for r in self._search_rows:
-                    w.writerow({k: r.get(k) for k in fields})
+                    row = {k: r.get(k) for k in fields}
+                    # Export dates in local time.
+                    row["dateSentIso"] = _fmt_ts_local_iso(r.get("dateSentIso", ""), r.get("dateSentMs"))
+                    w.writerow(row)
             self.export_status.set(f"Saved: {p}")
         except Exception as e:
             messagebox.showerror("Export failed", str(e))
@@ -3859,8 +3943,9 @@ class App:
         out.append(f"<h2>Search export</h2><p>Query: <b>{esc(self.q.get())}</b> Results: {len(self._search_rows)}</p>")
         out.append("<table><tr><th>Date</th><th>Recipient</th><th>Dir</th><th>Text</th><th>Attachments</th><th>chatId</th><th>rowid</th></tr>")
         for r in rows:
+            dt_local = _fmt_ts_local_iso(r.get("dateSentIso", ""), r.get("dateSentMs"))
             out.append("<tr>"
-                       f"<td>{esc(r.get('dateSentIso'))}</td>"
+                       f"<td>{esc(dt_local)}</td>"
                        f"<td>{esc(r.get('recipientName'))}</td>"
                        f"<td>{esc(r.get('dir'))}</td>"
                        f"<td>{esc(r.get('body'))}</td>"
@@ -3890,7 +3975,7 @@ class App:
         rname = recipient["name"] if recipient else "(unknown)"
 
         msgs = self._conn.execute(
-            "SELECT m.rowid, m.dateSentIso, m.outgoing, COALESCE(m.body,'') AS body FROM messages m WHERE m.chatId=? ORDER BY m.dateSentMs ASC, m.rowid ASC",
+            "SELECT m.rowid, m.dateSentIso, m.dateSentMs, m.outgoing, COALESCE(m.body,'') AS body FROM messages m WHERE m.chatId=? ORDER BY m.dateSentMs ASC, m.rowid ASC",
             (chat_id,),
         ).fetchall()
 
@@ -3935,7 +4020,8 @@ class App:
             mid = int(m["rowid"])
             who = authors.get(mid) or ("You" if m["outgoing"] else rname)
             cls = "you" if m["outgoing"] else "them"
-            out.append(f"<div class='msg'><div class='meta'>{esc(m['dateSentIso'])} <span class='{cls}'>{who}</span></div><div><code>{esc(m['body'])}</code></div>")
+            ts_local = _fmt_ts_local_iso(m["dateSentIso"] or "", m["dateSentMs"])
+            out.append(f"<div class='msg'><div class='meta'>{esc(ts_local)} <span class='{cls}'>{who}</span></div><div><code>{esc(m['body'])}</code></div>")
             atts = atts_by_msg.get(int(m["rowid"]), [])
             if atts:
                 out.append("<div class='att'>")
@@ -4007,7 +4093,7 @@ class App:
         rname = recipient["name"] if recipient else "(unknown)"
 
         msgs = self._conn.execute(
-            "SELECT m.rowid, m.dateSentIso, m.outgoing, COALESCE(m.body,'') AS body FROM messages m WHERE m.chatId=? ORDER BY m.dateSentMs ASC, m.rowid ASC",
+            "SELECT m.rowid, m.dateSentIso, m.dateSentMs, m.outgoing, COALESCE(m.body,'') AS body FROM messages m WHERE m.chatId=? ORDER BY m.dateSentMs ASC, m.rowid ASC",
             (chat_id,),
         ).fetchall()
 
@@ -4018,7 +4104,8 @@ class App:
         for m in msgs:
             mid = int(m["rowid"])
             who = authors.get(mid) or ("You" if m["outgoing"] else rname)
-            lines.append(f"## {m['dateSentIso']} {who}")
+            ts_local = _fmt_ts_local_iso(m["dateSentIso"] or "", m["dateSentMs"])
+            lines.append(f"## {ts_local} {who}")
             if m["body"]:
                 lines.append(m["body"])
             atts = atts_by_msg.get(int(m["rowid"]), [])

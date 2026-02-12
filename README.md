@@ -8,7 +8,7 @@ A desktop GUI for browsing, searching, and exporting your Signal message history
 
 - **Full-text search** across all conversations with search-as-you-type
 - **Media gallery** with dynamic grid layout, thumbnails for images/video/audio, and media type filtering
-- **Theming system** with stock presets (Signal Dark, Terminal, Solarized, etc.), live editing, import/export, and persistent settings
+- **Theming system** with stock presets (GitHub Light/Dark, Discord Dark, Spotify Dark, Slack Light, etc.), live editing, import/export, and persistent settings
 - **Attachment viewer** — click to open any attachment; right-click to copy path/filename
 - **Stats dashboard** — message counts, date ranges, busiest months, top conversations, attachment breakdown, MIME types, largest files, day-of-week / hour-of-day heatmaps, top emojis, top shared domains, who-texts-first analysis, conversation streaks, yearly volume, and more
 - **Word frequency analysis** — split into Your / Their / Combined top-40 lists, with a generated word cloud image (NLTK-grade stop-word filtering)
