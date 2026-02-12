@@ -136,18 +136,49 @@ def _extract_attachments(chat_item: dict) -> list[dict]:
     return ded
 
 
-def _build_basename_index(export_base: Path, log: Optional[Callable[[str], None]] = None) -> Dict[str, str]:
+def _build_file_indexes(export_base: Path, log: Optional[Callable[[str], None]] = None) -> Tuple[Dict[str, str], DefaultDict[int, List[str]]]:
+    """Single filesystem walk producing both basename→path map and size→[paths] index."""
     by_name: Dict[str, str] = {}
+    by_size: DefaultDict[int, List[str]] = defaultdict(list)
+    files_root = export_base / "files"
+    files_root_str = str(files_root.resolve()) if files_root.exists() else None
+
+    name_count = 0
+    size_count = 0
     for p in export_base.rglob("*"):
         if not p.is_file():
             continue
+        resolved = str(p.resolve())
         name = p.name.lower()
-        if name in ("main.jsonl",) or name.endswith((".db", ".db-wal", ".db-shm", ".tmp")):
-            continue
-        by_name.setdefault(name, str(p.resolve()))
+
+        # Basename index (skip DB/temp files)
+        if name not in ("main.jsonl",) and not name.endswith((".db", ".db-wal", ".db-shm", ".tmp")):
+            by_name.setdefault(name, resolved)
+            name_count += 1
+
+        # Size index (only files under files/)
+        if files_root_str and resolved.startswith(files_root_str):
+            try:
+                sz = int(p.stat().st_size)
+                by_size[sz].append(resolved)
+                size_count += 1
+            except Exception:
+                pass
+
     if log:
-        log(f"Indexed files by basename: {len(by_name):,}")
+        log(f"Indexed files by basename: {name_count:,}, by size (files/): {size_count:,}")
+    return by_name, by_size
+
+
+# Keep old names as aliases for backwards compatibility
+def _build_basename_index(export_base: Path, log: Optional[Callable[[str], None]] = None) -> Dict[str, str]:
+    by_name, _ = _build_file_indexes(export_base, log)
     return by_name
+
+
+def _build_files_by_size_index(export_base: Path, log: Optional[Callable[[str], None]] = None) -> DefaultDict[int, List[str]]:
+    _, by_size = _build_file_indexes(export_base, log)
+    return by_size
 
 
 def _resolve_rel_or_name(export_base: Path, rel_or_name: str, by_name: Dict[str, str]) -> str:
@@ -208,10 +239,16 @@ def _build_files_by_size_index(export_base: Path, log: Optional[Callable[[str], 
     return by_size
 
 
-def _resolve_by_plaintext_hash(files_by_size: DefaultDict[int, List[str]], plaintext_hash_b64: str, size_bytes: Optional[int]) -> str:
+def _resolve_by_plaintext_hash(
+    files_by_size: DefaultDict[int, List[str]],
+    plaintext_hash_b64: str,
+    size_bytes: Optional[int],
+    hash_cache: Optional[Dict[str, str]] = None,
+) -> str:
     """Resolve a local file by matching SHA-256(base64) against locatorInfo.plaintextHash.
 
     Uses size_bytes to narrow candidates (fast) and hashes only those candidates.
+    hash_cache maps file path → SHA-256 base64 to avoid re-hashing.
     """
     if not plaintext_hash_b64:
         return ""
@@ -221,10 +258,21 @@ def _resolve_by_plaintext_hash(files_by_size: DefaultDict[int, List[str]], plain
     cands = files_by_size.get(int(size_bytes)) or []
     if not cands:
         return ""
+
+    def _get_hash(fp: str) -> str:
+        if hash_cache is not None:
+            h = hash_cache.get(fp)
+            if h is not None:
+                return h
+        h = _sha256_b64_file(Path(fp))
+        if hash_cache is not None:
+            hash_cache[fp] = h
+        return h
+
     if len(cands) == 1:
         # Still validate hash to avoid false positives when size collides.
         try:
-            if _sha256_b64_file(Path(cands[0])) == plaintext_hash_b64:
+            if _get_hash(cands[0]) == plaintext_hash_b64:
                 return cands[0]
         except Exception:
             return ""
@@ -232,7 +280,7 @@ def _resolve_by_plaintext_hash(files_by_size: DefaultDict[int, List[str]], plain
 
     for p in cands:
         try:
-            if _sha256_b64_file(Path(p)) == plaintext_hash_b64:
+            if _get_hash(p) == plaintext_hash_b64:
                 return p
         except Exception:
             continue
@@ -276,8 +324,8 @@ def build_db(input_jsonl: Path, out_db: Path, store_raw_e164: bool = False, log:
     input_jsonl = input_jsonl.resolve()
     export_base_dir = input_jsonl.parent.resolve()
 
-    by_name = _build_basename_index(export_base_dir, log=_log)
-    files_by_size = _build_files_by_size_index(export_base_dir, log=_log)
+    by_name, files_by_size = _build_file_indexes(export_base_dir, log=_log)
+    hash_cache: Dict[str, str] = {}  # file_path → SHA-256 base64 (avoids re-hashing)
 
     tmp_db = out_db.with_suffix(out_db.suffix + ".tmp")
     if tmp_db.exists():
@@ -320,7 +368,8 @@ def build_db(input_jsonl: Path, out_db: Path, store_raw_e164: bool = False, log:
             outgoing INTEGER,
             dateSentMs INTEGER,
             dateSentIso TEXT,
-            body TEXT
+            body TEXT,
+            has_link INTEGER DEFAULT 0
         );
 
         CREATE TABLE attachments (
@@ -348,6 +397,7 @@ def build_db(input_jsonl: Path, out_db: Path, store_raw_e164: bool = False, log:
         CREATE INDEX idx_attachments_msg_kind ON attachments(message_rowid, kind);
         CREATE INDEX idx_chats_recipientId ON chats(recipientId);
         CREATE INDEX idx_recipients_name ON recipients(name);
+        CREATE INDEX idx_messages_has_link ON messages(has_link) WHERE has_link = 1;
         """
     )
 
@@ -415,8 +465,9 @@ def build_db(input_jsonl: Path, out_db: Path, store_raw_e164: bool = False, log:
                     continue
 
                 date_ms = ci.get("dateSent")
+                has_link = 1 if ('http://' in text or 'https://' in text) else 0
                 cur.execute(
-                    "INSERT INTO messages(chatId, authorId, outgoing, dateSentMs, dateSentIso, body) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO messages(chatId, authorId, outgoing, dateSentMs, dateSentIso, body, has_link) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         ci.get("chatId"),
                         ci.get("authorId"),
@@ -424,6 +475,7 @@ def build_db(input_jsonl: Path, out_db: Path, store_raw_e164: bool = False, log:
                         int(date_ms) if date_ms is not None else None,
                         _ms_to_iso(date_ms),
                         text,
+                        has_link,
                     ),
                 )
                 msg_rowid = cur.lastrowid
@@ -485,7 +537,7 @@ def build_db(input_jsonl: Path, out_db: Path, store_raw_e164: bool = False, log:
 
                     # If we have plaintextHash (base64 of sha256(local file)) + size, resolve via files/ tree.
                     if not abs_path and plaintext_hash_b64 and size_b:
-                        abs_path = _resolve_by_plaintext_hash(files_by_size, plaintext_hash_b64, size_b)
+                        abs_path = _resolve_by_plaintext_hash(files_by_size, plaintext_hash_b64, size_b, hash_cache)
 
                     # last resort: try digest hex as basename with extension from mime
                     if not abs_path and digest_hex:
@@ -529,6 +581,7 @@ def build_db(input_jsonl: Path, out_db: Path, store_raw_e164: bool = False, log:
             m.dateSentMs,
             m.dateSentIso,
             m.body,
+            m.has_link,
             rr.name AS recipientName,
             rr.type AS recipientType
         FROM messages m

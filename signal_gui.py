@@ -30,6 +30,7 @@ import sys
 import threading
 import traceback
 import webbrowser
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -386,12 +387,14 @@ class App:
         # Search-as-you-type debounce state
         self._search_debounce_id: Optional[str] = None
 
-        # In-memory PhotoImage cache
-        self._photo_cache: Dict[str, ImageTk.PhotoImage] = {}
+        # In-memory PhotoImage LRU cache (capped at 600 entries)
+        self._photo_cache: OrderedDict[str, ImageTk.PhotoImage] = OrderedDict()
+        self._photo_cache_max = 600
 
         self._build_lock = threading.Lock()
         self._conn: Optional[sqlite3.Connection] = None
         self._has_fts5: bool = False
+        self._has_link_col: bool = False
 
         self._search_rows: List[Dict[str, Any]] = []
         self._chat_hits: List[Dict[str, Any]] = []
@@ -455,6 +458,32 @@ class App:
     def _clear_photo_cache(self) -> None:
         """Flush the in-memory PhotoImage cache."""
         self._photo_cache.clear()
+
+    def _photo_cache_put(self, key: str, photo: ImageTk.PhotoImage) -> None:
+        """Insert into LRU cache with eviction when over capacity."""
+        self._photo_cache[key] = photo
+        self._photo_cache.move_to_end(key)
+        while len(self._photo_cache) > self._photo_cache_max:
+            self._photo_cache.popitem(last=False)
+
+    def _batch_fetch_attachments(self, message_rowids: List[int]) -> Dict[int, List[sqlite3.Row]]:
+        """Fetch attachments for many messages in one query, grouped by message_rowid."""
+        if not message_rowids or self._conn is None:
+            return {}
+        result: Dict[int, List[sqlite3.Row]] = {}
+        # SQLite variable limit is 999 by default; batch in chunks
+        for i in range(0, len(message_rowids), 900):
+            chunk = message_rowids[i:i + 900]
+            ph = ",".join(["?"] * len(chunk))
+            rows = self._conn.execute(
+                f"SELECT message_rowid, file_name, abs_path, mime, size_bytes, width, height, duration_ms, kind "
+                f"FROM attachments WHERE message_rowid IN ({ph}) ORDER BY message_rowid, id ASC",
+                tuple(chunk),
+            ).fetchall()
+            for r in rows:
+                mid = int(r["message_rowid"])
+                result.setdefault(mid, []).append(r)
+        return result
 
     def _rebuild_thumb_cache(self, log_func=None) -> None:
         """Delete the .thumbcache/ directory and rebuild thumbnails for all known attachments."""
@@ -578,6 +607,7 @@ class App:
             mem_key += f"|dur={duration_ms}"
         cached = self._photo_cache.get(mem_key)
         if cached is not None:
+            self._photo_cache.move_to_end(mem_key)
             return cached
 
         cache_dir = self._thumb_cache_dir()
@@ -619,7 +649,7 @@ class App:
                     if duration_ms and kind in ("video", "audio"):
                         im = self._draw_duration_overlay(im, duration_ms)
                     photo = ImageTk.PhotoImage(im)
-                    self._photo_cache[mem_key] = photo
+                    self._photo_cache_put(mem_key, photo)
                     return photo
 
                 im = Image.open(str(cache_img))
@@ -636,7 +666,7 @@ class App:
                 im = self._draw_duration_overlay(im, duration_ms)
 
             photo = ImageTk.PhotoImage(im)
-            self._photo_cache[mem_key] = photo
+            self._photo_cache_put(mem_key, photo)
             return photo
         except Exception:
             try:
@@ -645,7 +675,7 @@ class App:
                 if duration_ms and kind in ("video", "audio"):
                     im = self._draw_duration_overlay(im, duration_ms)
                 photo = ImageTk.PhotoImage(im)
-                self._photo_cache[mem_key] = photo
+                self._photo_cache_put(mem_key, photo)
                 return photo
             except Exception:
                 return None
@@ -1670,6 +1700,10 @@ class App:
         self._build_exports_tab(export_tab)
         self._build_stats_tab(stats_tab)
 
+        # Lazy gallery refresh: only load thumbnails when switching to Gallery tab
+        self._gallery_needs_refresh = False
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
         # Restore last selected tab / gallery chat
         try:
             if hasattr(self, "_restore_tab_index") and self._restore_tab_index is not None:
@@ -1829,6 +1863,12 @@ class App:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA cache_size=-8000")  # 8 MB
             self._has_fts5 = _fts5_available(conn) and _table_exists(conn, "messages_fts")
+            # Check for has_link column (added in newer DB builds)
+            try:
+                conn.execute("SELECT has_link FROM messages LIMIT 1")
+                self._has_link_col = True
+            except sqlite3.OperationalError:
+                self._has_link_col = False
             self._conn = conn
             mode = "FTS5" if self._has_fts5 else "LIKE"
             ffmpeg = "yes" if shutil.which("ffmpeg") else "no"
@@ -2093,7 +2133,11 @@ class App:
 
         has_link_sql = ""
         if params.has_links:
-            has_link_sql = " AND (e.body LIKE '%http://%' OR e.body LIKE '%https://%') "
+            # Use indexed has_link column if available, fall back to LIKE
+            if self._has_link_col:
+                has_link_sql = " AND e.has_link = 1 "
+            else:
+                has_link_sql = " AND (e.body LIKE '%http://%' OR e.body LIKE '%https://%') "
 
         if params.q:
             # --- Text query present: use FTS5 or LIKE ---
@@ -2216,9 +2260,14 @@ class App:
         vals = self.chat_tree.item(sel[0], "values")
         if not vals or len(vals) < 3:
             return
-        self._render_hits_for_chat(int(vals[2]))
-        self._gallery_selected_chat_id.set(str(int(vals[2])))
-        self._refresh_gallery_for_chat(int(vals[2]))
+        chat_id = int(vals[2])
+        self._render_hits_for_chat(chat_id)
+        self._gallery_selected_chat_id.set(str(chat_id))
+        # Only load gallery thumbnails if the Gallery tab is currently visible
+        if self.nb.index(self.nb.select()) == 2:  # Gallery tab index
+            self._refresh_gallery_for_chat(chat_id)
+        else:
+            self._gallery_needs_refresh = True
 
     def _render_hits_for_chat(self, chat_id: Optional[int]) -> None:
         self._selected_chat_id = chat_id
@@ -2293,26 +2342,33 @@ class App:
 
     def _load_context_window(self, rowid: int, n: int) -> List[Dict[str, Any]]:
         assert self._conn is not None
+        # Step 1: locate the hit's chat and timestamp (indexed lookup)
+        hit = self._conn.execute(
+            "SELECT chatId, dateSentMs FROM messages WHERE rowid = :rowid", {"rowid": rowid}
+        ).fetchone()
+        if not hit:
+            return []
+        chat_id = hit["chatId"]
+        hit_ms = hit["dateSentMs"]
+
+        # Step 2: count how many rows in this chat come before the hit (using chatId+date index)
+        pos = self._conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE chatId = :cid AND (dateSentMs < :ms OR (dateSentMs = :ms AND rowid < :rid))",
+            {"cid": chat_id, "ms": hit_ms, "rid": rowid},
+        ).fetchone()[0]
+
+        offset = max(0, pos - n)
+        limit = 2 * n + 1
+
+        # Step 3: fetch only the context window from this one chat
         q = """
-        WITH ordered AS (
-          SELECT
-            m.rowid AS rowid,
-            m.chatId,
-            m.outgoing,
-            m.dateSentMs,
-            m.dateSentIso,
-            m.body,
-            ROW_NUMBER() OVER (PARTITION BY m.chatId ORDER BY m.dateSentMs ASC, m.rowid ASC) AS rn
-          FROM messages m
-        ),
-        hit AS (SELECT chatId, rn FROM ordered WHERE rowid = :rowid)
-        SELECT o.rowid, o.outgoing, o.dateSentIso, o.dateSentMs, COALESCE(o.body,'') AS body
-        FROM ordered o
-        JOIN hit h ON h.chatId = o.chatId
-        WHERE o.rn BETWEEN h.rn - :n AND h.rn + :n
-        ORDER BY o.dateSentMs ASC, o.rowid ASC
+        SELECT m.rowid AS rowid, m.outgoing, m.dateSentIso, m.dateSentMs, COALESCE(m.body,'') AS body
+        FROM messages m
+        WHERE m.chatId = :cid
+        ORDER BY m.dateSentMs ASC, m.rowid ASC
+        LIMIT :lim OFFSET :off
         """
-        return [dict(r) for r in self._conn.execute(q, {"rowid": rowid, "n": n}).fetchall()]
+        return [dict(r) for r in self._conn.execute(q, {"cid": chat_id, "lim": limit, "off": offset}).fetchall()]
 
     def _highlight_term_in_text(self, txt: tk.Text, term: str) -> None:
         if not term:
@@ -2337,7 +2393,9 @@ class App:
         self._preview_img_refs: List[Any] = []
         link_idx = 0
 
-        authors = self._speaker_names_for_message_ids([int(m["rowid"]) for m in rows])
+        msg_ids = [int(m["rowid"]) for m in rows]
+        authors = self._speaker_names_for_message_ids(msg_ids)
+        atts_by_msg = self._batch_fetch_attachments(msg_ids)
 
         def add_link(label: str, path: str) -> None:
             nonlocal link_idx
@@ -2366,10 +2424,7 @@ class App:
             e = self.preview_txt.index(tk.END)
             ranges[mid] = (s, e)
 
-            atts = self._conn.execute(
-                "SELECT file_name, abs_path, mime, size_bytes, width, height, duration_ms, kind FROM attachments WHERE message_rowid=? ORDER BY id ASC",
-                (mid,),
-            ).fetchall()
+            atts = atts_by_msg.get(mid, [])
             if atts:
                 self.preview_txt.insert(tk.END, "\n")
                 for a in atts:
@@ -2507,6 +2562,7 @@ class App:
         win.bind("<Destroy>", lambda e: _prune_open_thread_texts() if e.widget is win else None)
 
         win._img_refs = []  # type: ignore[attr-defined]
+        atts_by_msg = self._batch_fetch_attachments([int(m["rowid"]) for m in msgs])
 
         ranges: Dict[int, Tuple[str, str]] = {}
         link_idx = 0
@@ -2537,10 +2593,7 @@ class App:
             e = txt.index(tk.END)
             ranges[mid] = (s, e)
 
-            atts = self._conn.execute(
-                "SELECT file_name, abs_path, mime, size_bytes, width, height, duration_ms, kind FROM attachments WHERE message_rowid=? ORDER BY id ASC",
-                (mid,),
-            ).fetchall()
+            atts = atts_by_msg.get(mid, [])
             if atts:
                 txt.insert(tk.END, "\n")
                 for a in atts:
@@ -2771,6 +2824,17 @@ class App:
             return int(s)
         except Exception:
             return None
+
+    def _on_tab_changed(self, _evt=None) -> None:
+        """Lazy-load gallery when user switches to the Gallery tab."""
+        try:
+            if self.nb.index(self.nb.select()) == 2 and self._gallery_needs_refresh:
+                self._gallery_needs_refresh = False
+                cid = self._safe_int(self._gallery_selected_chat_id.get())
+                if cid:
+                    self._refresh_gallery_for_chat(cid)
+        except Exception:
+            pass
 
     def _refresh_gallery_for_chat(self, chat_id: Optional[int]) -> None:
         if self._conn is None and not self._connect():
@@ -3156,7 +3220,10 @@ class App:
             lines.append("")
 
         # --- Messages with links ---
-        link_count = _q1("SELECT COUNT(*) FROM messages WHERE body LIKE '%http://%' OR body LIKE '%https://%'") or 0
+        if self._has_link_col:
+            link_count = _q1("SELECT COUNT(*) FROM messages WHERE has_link = 1") or 0
+        else:
+            link_count = _q1("SELECT COUNT(*) FROM messages WHERE body LIKE '%http://%' OR body LIKE '%https://%'") or 0
         if msg_count:
             lines.append("═══════════════ EXTRAS ═══════════════")
             lines.append(f"  Messages containing links:  {link_count:,}  ({link_count*100/msg_count:.1f}%)")
@@ -3237,31 +3304,15 @@ class App:
         except Exception:
             pass
 
-        # --- Top shared domains ---
+        # --- Single-pass body scan for domains, emoji, and word counts ---
+        # (Avoids 3-4 separate full table scans of messages)
+        domain_counts: dict[str, int] = {}
+        emoji_counts: dict[str, int] = {}
+        your_word_counts: dict[str, int] = {}
+        their_word_counts: dict[str, int] = {}
+        top_combined: list[tuple[str, int]] = []
         try:
-            url_rows = _qall("""
-                SELECT body FROM messages
-                WHERE body LIKE '%http://%' OR body LIKE '%https://%'
-            """)
-            if url_rows:
-                from collections import Counter as _Counter
-                domain_counts: dict[str, int] = {}
-                url_re = re.compile(r'https?://([^/\s?#]+)')
-                for r in url_rows:
-                    for m in url_re.finditer(r[0] or ""):
-                        dom = m.group(1).lower()
-                        domain_counts[dom] = domain_counts.get(dom, 0) + 1
-                top_domains = sorted(domain_counts.items(), key=lambda x: -x[1])[:15]
-                if top_domains:
-                    lines.append("═══════════════ TOP SHARED DOMAINS ═══════════════")
-                    for dom, cnt in top_domains:
-                        lines.append(f"  {dom:<40}  {cnt:,}")
-                    lines.append("")
-        except Exception:
-            pass
-
-        # --- Emoji usage ---
-        try:
+            url_re = re.compile(r'https?://([^/\s?#]+)')
             emoji_re = re.compile(
                 '['
                 '\U0001F600-\U0001F64F'  # emoticons
@@ -3278,40 +3329,55 @@ class App:
                 '\U00002764'             # heart
                 ']+'
             )
-            all_bodies = _qall("SELECT body FROM messages WHERE body IS NOT NULL AND body != ''")
-            emoji_counts: dict[str, int] = {}
-            for r in all_bodies:
-                for m in emoji_re.finditer(r[0]):
-                    e = m.group()
-                    emoji_counts[e] = emoji_counts.get(e, 0) + 1
+            word_re = re.compile(r"[a-zA-Z'\u2019]+")
+
+            cursor = conn.execute("SELECT body, outgoing FROM messages WHERE body IS NOT NULL AND body != ''")
+            while True:
+                batch = cursor.fetchmany(2000)
+                if not batch:
+                    break
+                for body_text, outgoing in batch:
+                    # URLs / domains
+                    for m in url_re.finditer(body_text):
+                        dom = m.group(1).lower()
+                        domain_counts[dom] = domain_counts.get(dom, 0) + 1
+                    # Emojis
+                    for m in emoji_re.finditer(body_text):
+                        e = m.group()
+                        emoji_counts[e] = emoji_counts.get(e, 0) + 1
+                    # Words (split by outgoing)
+                    tgt = your_word_counts if outgoing else their_word_counts
+                    for w in word_re.findall(body_text):
+                        wl = w.lower().replace("'", "").replace("\u2019", "")
+                        if len(wl) >= 3 and wl not in _STOP_WORDS:
+                            tgt[wl] = tgt.get(wl, 0) + 1
+        except Exception:
+            pass
+
+        # --- Top shared domains ---
+        if domain_counts:
+            top_domains = sorted(domain_counts.items(), key=lambda x: -x[1])[:15]
+            if top_domains:
+                lines.append("═══════════════ TOP SHARED DOMAINS ═══════════════")
+                for dom, cnt in top_domains:
+                    lines.append(f"  {dom:<40}  {cnt:,}")
+                lines.append("")
+
+        # --- Emoji usage ---
+        if emoji_counts:
             top_emoji = sorted(emoji_counts.items(), key=lambda x: -x[1])[:20]
             if top_emoji:
                 lines.append("═══════════════ TOP 20 EMOJIS ═══════════════")
                 total_emoji = sum(emoji_counts.values())
                 lines.append(f"  Unique emojis used: {len(emoji_counts):,}   Total emoji uses: {total_emoji:,}")
-                # Display in rows of 5
                 for i in range(0, len(top_emoji), 5):
                     chunk = top_emoji[i:i+5]
                     parts = [f"{e} ×{c:,}" for e, c in chunk]
                     lines.append("  " + "   ".join(parts))
                 lines.append("")
-        except Exception:
-            pass
 
         # --- Most used words (split: You / Them / Combined) ---
-        top_combined: list[tuple[str, int]] = []
         try:
-            word_re = re.compile(r"[a-zA-Z'\u2019]+")
-
-            def _count_words(rows):
-                counts: dict[str, int] = {}
-                for r in rows:
-                    for w in word_re.findall(r[0]):
-                        wl = w.lower().replace("'", "").replace("\u2019", "")
-                        if len(wl) >= 3 and wl not in _STOP_WORDS:
-                            counts[wl] = counts.get(wl, 0) + 1
-                return counts
-
             def _render_top(counts, n=40):
                 top = sorted(counts.items(), key=lambda x: -x[1])[:n]
                 if not top:
@@ -3322,27 +3388,21 @@ class App:
                     lines.append(f"  {w:<20}  {'█' * bar_len}  {c:,}")
                 return top
 
-            your_bodies = _qall("SELECT body FROM messages WHERE body IS NOT NULL AND body != '' AND outgoing = 1")
-            their_bodies = _qall("SELECT body FROM messages WHERE body IS NOT NULL AND body != '' AND outgoing = 0")
-
-            your_counts = _count_words(your_bodies)
-            their_counts = _count_words(their_bodies)
-
             # Combined (for word cloud)
             all_counts: dict[str, int] = {}
-            for wl, c in your_counts.items():
+            for wl, c in your_word_counts.items():
                 all_counts[wl] = all_counts.get(wl, 0) + c
-            for wl, c in their_counts.items():
+            for wl, c in their_word_counts.items():
                 all_counts[wl] = all_counts.get(wl, 0) + c
 
-            if your_counts:
+            if your_word_counts:
                 lines.append("═══════════════ YOUR MOST USED WORDS (top 40) ═══════════════")
-                _render_top(your_counts)
+                _render_top(your_word_counts)
                 lines.append("")
 
-            if their_counts:
+            if their_word_counts:
                 lines.append("═══════════════ THEIR MOST USED WORDS (top 40) ═══════════════")
-                _render_top(their_counts)
+                _render_top(their_word_counts)
                 lines.append("")
 
             top_combined = sorted(all_counts.items(), key=lambda x: -x[1])[:40]
@@ -3651,15 +3711,13 @@ class App:
             "</style>"
         )
         out.append(f"<h2>Thread: {esc(rname)} (chatId={chat_id})</h2>")
+        atts_by_msg = self._batch_fetch_attachments([int(m["rowid"]) for m in msgs])
 
         for m in msgs:
             who = "YOU" if m["outgoing"] else "THEM"
             cls = "you" if m["outgoing"] else "them"
             out.append(f"<div class='msg'><div class='meta'>{esc(m['dateSentIso'])} <span class='{cls}'>{who}</span></div><div><code>{esc(m['body'])}</code></div>")
-            atts = self._conn.execute(
-                "SELECT file_name, abs_path, mime, kind, size_bytes, width, height, duration_ms FROM attachments WHERE message_rowid=? ORDER BY id ASC",
-                (m["rowid"],),
-            ).fetchall()
+            atts = atts_by_msg.get(int(m["rowid"]), [])
             if atts:
                 out.append("<div class='att'>")
                 for a in atts:
@@ -3735,15 +3793,13 @@ class App:
         ).fetchall()
 
         lines = [f"# Thread: {rname} (chatId={chat_id})", ""]
+        atts_by_msg = self._batch_fetch_attachments([int(m["rowid"]) for m in msgs])
         for m in msgs:
             who = "YOU" if m["outgoing"] else "THEM"
             lines.append(f"## {m['dateSentIso']} {who}")
             if m["body"]:
                 lines.append(m["body"])
-            atts = self._conn.execute(
-                "SELECT file_name, abs_path, mime, kind, size_bytes, width, height, duration_ms FROM attachments WHERE message_rowid=? ORDER BY id ASC",
-                (m["rowid"],),
-            ).fetchall()
+            atts = atts_by_msg.get(int(m["rowid"]), [])
             if atts:
                 lines.append("")
                 lines.append("**Attachments:**")
