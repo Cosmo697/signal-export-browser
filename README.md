@@ -8,12 +8,12 @@ A desktop GUI for browsing, searching, and exporting your Signal message history
 
 - **Full-text search** across all conversations with search-as-you-type
 - **Media gallery** with dynamic grid layout, thumbnails for images/video/audio, and media type filtering
-- **Theming system** with stock presets (GitHub Light/Dark, Discord Dark, Spotify Dark, Slack Light, etc.), live editing, import/export, and persistent settings
+- **Light/Dark mode toggle** (high-contrast UI + highly visible hit/selection highlighting)
 - **Attachment viewer** — click to open any attachment; right-click to copy path/filename
 - **Stats dashboard** — message counts, date ranges, busiest months, top conversations, attachment breakdown, MIME types, largest files, day-of-week / hour-of-day heatmaps, top emojis, top shared domains, who-texts-first analysis, conversation streaks, yearly volume, and more
 - **Word frequency analysis** — split into Your / Their / Combined top-40 lists, with a generated word cloud image (NLTK-grade stop-word filtering)
-- **Stats export** — save the full stats report as themed HTML (with inline word cloud) or plain text
-- **HTML export** with inline thumbnails, themed styling, and full metadata
+- **Stats export** — save the full stats report as styled HTML (with inline word cloud) or plain text
+- **HTML export** with inline thumbnails, styled output, and full metadata
 - **DB builder** — converts `main.jsonl` into a searchable SQLite database with FTS5, speaker names, and attachment resolution
 - **Filters** — filter by "has attachments", "has links", date range, direction (in/out), attachment type, and more
 - **Thumbnail caching** — persistent `.thumbcache/` directory with ffmpeg frame extraction for video and cover art for audio
@@ -76,7 +76,7 @@ your-signal-export/
 - `signal.db` — SQLite database built from your export
 - `.thumbcache/` — cached thumbnail images
 - `app_state.json` — window state, last DB path, etc.
-- `theme.json` — your active theme settings
+- (settings are stored in `app_state.json`)
 
 ## Usage
 
@@ -101,9 +101,9 @@ Type in the search box and results appear automatically (debounced). Use the fil
 3. Use the **Type** dropdown to filter by image, video, audio, doc, or file
 4. Columns adjust dynamically to your window width
 
-### Themes
+### Light/Dark mode
 
-Open **Settings → Theme** to choose from stock presets or create your own. Themes are saved to `theme.json` and restored on next launch.
+Use **Settings → Dark mode** to switch between light and dark UI.
 
 ### Stats
 
@@ -123,7 +123,7 @@ Click **Export Stats** to save everything as HTML or plain text.
 
 - **Search results** — export as CSV or HTML from the Search tab
 - **Threads** — export a full conversation as styled HTML or Markdown from the Export tab
-- **Stats** — click **Export Stats** on the Stats tab to save as themed HTML (with word cloud) or plain text
+- **Stats** — click **Export Stats** on the Stats tab to save as styled HTML (with word cloud) or plain text
 
 ## Optional: ffmpeg
 

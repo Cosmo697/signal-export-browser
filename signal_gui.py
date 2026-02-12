@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, colorchooser
+from tkinter import ttk, filedialog, messagebox
 import tkinter.font as tkfont
 
 from PIL import Image, ImageTk, ImageDraw, ImageFont
@@ -65,8 +65,7 @@ from gui_utils import (
 )
 from stop_words import STOP_WORDS as _STOP_WORDS
 
-# Theming (presets, dialog, ttk styling)
-from theming import ThemeSupport
+# Light/Dark mode is implemented directly in this file.
 
 import build_signal_db
 
@@ -86,20 +85,18 @@ class SearchParams:
     has_links: bool = False
 
 
-class App(ThemeSupport):
+class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Signal Export Browser v3")
         self.root.geometry("1380x840")
 
         self._state_path = Path.cwd() / "app_state.json"
-        self._themes_path = Path.cwd() / "themes.json"
         self._cache_state_path = Path.cwd() / "cache_state.json"
 
-        self.theme: Dict[str, Any] = self._default_theme()
-        self.active_theme_name: str = ""
-        self.custom_themes: Dict[str, Dict[str, Any]] = {}
-        self._load_custom_themes()
+        # Light/Dark mode toggle (no custom themes)
+        self.dark_mode = tk.BooleanVar(value=False)
+        self.theme: Dict[str, Any] = self._palette_for_mode(False)
 
         self._open_thread_text_widgets: List[tk.Text] = []
         self._style = ttk.Style(self.root)
@@ -147,13 +144,262 @@ class App(ThemeSupport):
         self._hit_idx: int = -1
         self._current_terms: List[str] = []
 
-        # Restore last state (theme + UI fields) if available
+        # Restore last state (UI fields + light/dark mode) if available
         self._load_app_state()
+
+        # Apply persisted mode selection
+        self.theme = self._palette_for_mode(bool(self.dark_mode.get()))
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._make_ui()
-        self._apply_theme_now()
+        self._apply_mode_now()
+
+    # ---------- Light/Dark mode + high-contrast styling ----------
+
+    @staticmethod
+    def _palette_light() -> Dict[str, Any]:
+        # High-contrast light palette
+        return {
+            "app_bg": "#f3f4f6",
+            "panel_bg": "#ffffff",
+            "widget_bg": "#ffffff",
+            "widget_fg": "#111827",
+            "text_bg": "#ffffff",
+            "text_fg": "#111827",
+            "meta_fg": "#374151",
+            "you_fg": "#0b5cad",
+            "them_fg": "#166534",
+            "link_fg": "#0b5cad",
+            "accent": "#0b5cad",
+            "select_bg": "#0b5cad",
+            "select_fg": "#ffffff",
+            # Strong highlight fills with forced readable text
+            "hit_bg": "#ffea00",
+            "term_bg": "#00d5ff",
+        }
+
+    @staticmethod
+    def _palette_dark() -> Dict[str, Any]:
+        # High-contrast dark palette
+        return {
+            "app_bg": "#0b0d10",
+            "panel_bg": "#0f1318",
+            "widget_bg": "#151b22",
+            "widget_fg": "#e5e7eb",
+            "text_bg": "#0f1318",
+            "text_fg": "#f3f4f6",
+            "meta_fg": "#cbd5e1",
+            "you_fg": "#7dd3fc",
+            "them_fg": "#86efac",
+            "link_fg": "#60a5fa",
+            "accent": "#60a5fa",
+            "select_bg": "#2563eb",
+            "select_fg": "#ffffff",
+            # Strong highlight fills with forced readable text
+            "hit_bg": "#ffcc00",
+            "term_bg": "#00e5ff",
+        }
+
+    def _palette_for_mode(self, dark: bool) -> Dict[str, Any]:
+        return dict(self._palette_dark() if dark else self._palette_light())
+
+    def _apply_mode_now(self) -> None:
+        # ttk + menus + all text widgets + open thread windows
+        self._apply_palette_to_ttk()
+        self._apply_palette_to_menu()
+
+        for wname in ("preview_txt", "build_log"):
+            try:
+                w = getattr(self, wname)
+                if isinstance(w, tk.Text):
+                    self._apply_palette_to_text(w)
+            except Exception:
+                pass
+
+        # Stats dashboard canvas (tk widget; needs manual bg)
+        try:
+            c = getattr(self, "_stats_canvas", None)
+            if isinstance(c, tk.Canvas):
+                c.configure(
+                    bg=self.theme.get("panel_bg", "#ffffff"),
+                    highlightthickness=0,
+                    bd=0,
+                )
+        except Exception:
+            pass
+
+        # Open thread windows
+        try:
+            alive: List[tk.Text] = []
+            for t in self._open_thread_text_widgets:
+                try:
+                    if t.winfo_exists():
+                        self._apply_palette_to_text(t)
+                        alive.append(t)
+                except Exception:
+                    continue
+            self._open_thread_text_widgets = alive
+        except Exception:
+            pass
+
+        # Root background (helps on some platforms)
+        try:
+            self.root.configure(bg=self.theme.get("app_bg", "#0b0d10"))
+        except Exception:
+            pass
+
+    def _apply_palette_to_ttk(self) -> None:
+        # Force a theme where color maps work reliably.
+        try:
+            if "clam" in self._style.theme_names():
+                self._style.theme_use("clam")
+        except Exception:
+            pass
+
+        app_bg = self.theme.get("app_bg", "#f3f4f6")
+        panel_bg = self.theme.get("panel_bg", "#ffffff")
+        widget_bg = self.theme.get("widget_bg", panel_bg)
+        fg = self.theme.get("widget_fg", "#111827")
+        sel_bg = self.theme.get("select_bg", "#0b5cad")
+        sel_fg = self.theme.get("select_fg", "#ffffff")
+
+        s = self._style
+        try:
+            s.configure(".", background=panel_bg, foreground=fg)
+        except Exception:
+            pass
+        s.configure("TFrame", background=panel_bg)
+        s.configure("TLabelframe", background=panel_bg, foreground=fg)
+        s.configure("TLabelframe.Label", background=panel_bg, foreground=fg)
+        s.configure("TLabel", background=panel_bg, foreground=fg)
+
+        s.configure("TButton", background=widget_bg, foreground=fg, padding=(10, 5))
+        s.map(
+            "TButton",
+            background=[("pressed", sel_bg), ("active", sel_bg)],
+            foreground=[("pressed", sel_fg), ("active", sel_fg)],
+        )
+
+        s.configure("TEntry", fieldbackground=widget_bg, foreground=fg)
+        s.configure("TCombobox", fieldbackground=widget_bg, foreground=fg)
+        try:
+            s.map(
+                "TCombobox",
+                fieldbackground=[("readonly", widget_bg)],
+                foreground=[("readonly", fg)],
+                selectbackground=[("readonly", sel_bg)],
+                selectforeground=[("readonly", sel_fg)],
+            )
+        except Exception:
+            pass
+
+        s.configure("TNotebook", background=app_bg)
+        s.configure("TNotebook.Tab", background=widget_bg, foreground=fg, padding=(12, 6))
+        s.map(
+            "TNotebook.Tab",
+            background=[("selected", panel_bg), ("active", sel_bg)],
+            foreground=[("selected", fg), ("active", sel_fg)],
+        )
+
+        s.configure(
+            "Treeview",
+            background=panel_bg,
+            fieldbackground=panel_bg,
+            foreground=fg,
+            rowheight=22,
+        )
+        s.configure("Treeview.Heading", background=widget_bg, foreground=fg)
+        s.map("Treeview", background=[("selected", sel_bg)], foreground=[("selected", sel_fg)])
+
+        # Dashboard bars
+        try:
+            s.configure(
+                "Horizontal.TProgressbar",
+                background=self.theme.get("accent", sel_bg),
+                troughcolor=widget_bg,
+            )
+        except Exception:
+            pass
+
+    def _apply_palette_to_menu(self) -> None:
+        bg = self.theme.get("panel_bg", "#ffffff")
+        fg = self.theme.get("widget_fg", "#111827")
+        abg = self.theme.get("select_bg", "#0b5cad")
+        afg = self.theme.get("select_fg", "#ffffff")
+
+        def _apply(m: Optional[tk.Menu]) -> None:
+            if m is None:
+                return
+            try:
+                m.configure(background=bg, foreground=fg, activebackground=abg, activeforeground=afg)
+            except Exception:
+                return
+            try:
+                end = m.index("end")
+                if end is None:
+                    return
+                for i in range(end + 1):
+                    try:
+                        sub = m.entrycget(i, "menu")
+                        if sub:
+                            _apply(m.nametowidget(sub))
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        _apply(getattr(self, "_menubar", None))
+        _apply(getattr(self, "_settings_menu", None))
+
+    def _apply_palette_to_text(self, txt: tk.Text) -> None:
+        bg = self.theme.get("text_bg", "#ffffff")
+        fg = self.theme.get("text_fg", "#111827")
+        sel_bg = self.theme.get("select_bg", "#0b5cad")
+        sel_fg = self.theme.get("select_fg", "#ffffff")
+        meta = self.theme.get("meta_fg", "#374151")
+        you = self.theme.get("you_fg", "#0b5cad")
+        them = self.theme.get("them_fg", "#166534")
+        link = self.theme.get("link_fg", "#0b5cad")
+        hit_bg = self.theme.get("hit_bg", "#ffea00")
+        term_bg = self.theme.get("term_bg", "#00d5ff")
+
+        # Force readable text in highlighted regions.
+        hit_fg = "#000000"
+        term_fg = "#000000"
+
+        try:
+            txt.configure(
+                background=bg,
+                foreground=fg,
+                insertbackground=fg,
+                selectbackground=sel_bg,
+                selectforeground=sel_fg,
+                inactiveselectbackground=sel_bg,
+            )
+        except Exception:
+            pass
+
+        txt.tag_configure("meta", foreground=meta)
+        txt.tag_configure("you", foreground=you)
+        txt.tag_configure("them", foreground=them)
+        txt.tag_configure("hit", background=hit_bg, foreground=hit_fg)
+        txt.tag_configure("term", background=term_bg, foreground=term_fg)
+        txt.tag_configure("link", foreground=link, underline=True)
+        txt.tag_configure("pv_link", foreground=link, underline=True)
+
+        # Keep highlighted text readable even when it's also a link.
+        try:
+            txt.tag_lower("link")
+            txt.tag_lower("pv_link")
+            txt.tag_raise("hit")
+            txt.tag_raise("term")
+        except Exception:
+            pass
+
+    def _on_toggle_dark_mode(self) -> None:
+        self.theme = self._palette_for_mode(bool(self.dark_mode.get()))
+        self._apply_mode_now()
 
     def _thumb_cache_dir(self) -> Path:
         d = Path.cwd() / ".thumbcache"
@@ -569,19 +815,6 @@ class App(ThemeSupport):
             import json
 
             if not self._state_path.exists():
-                # Back-compat: if the old theme.json exists, load it as the starting look.
-                legacy = Path.cwd() / "theme.json"
-                if legacy.exists():
-                    try:
-                        data = json.loads(legacy.read_text(encoding="utf-8"))
-                        if isinstance(data, dict):
-                            raw = dict(self.theme)
-                            for k, v in data.items():
-                                if isinstance(k, str) and isinstance(v, (str, int)):
-                                    raw[k] = v
-                            self.theme = self._normalize_theme(raw)
-                    except Exception:
-                        pass
                 return
             st = json.loads(self._state_path.read_text(encoding="utf-8"))
             if not isinstance(st, dict):
@@ -594,17 +827,21 @@ class App(ThemeSupport):
                 except Exception:
                     pass
 
-            # Theme: restore exact last-used theme dict to match "as last closed"
-            t = st.get("theme")
-            if isinstance(t, dict):
-                raw = dict(self.theme)
-                for k, v in t.items():
-                    if isinstance(k, str) and isinstance(v, (str, int)):
-                        raw[k] = v
-                self.theme = self._normalize_theme(raw)
-            nm = st.get("active_theme_name")
-            if isinstance(nm, str):
-                self.active_theme_name = nm
+            # Light/Dark mode (current)
+            dm = st.get("dark_mode")
+            if isinstance(dm, bool):
+                self.dark_mode.set(dm)
+            else:
+                # Back-compat: infer mode from older saved theme dicts (when present)
+                t = st.get("theme")
+                if isinstance(t, dict):
+                    try:
+                        bg_hex = str(t.get("text_bg") or t.get("app_bg") or "").strip() or "#ffffff"
+                        r, g, b = _hex_to_rgb(bg_hex)
+                        lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+                        self.dark_mode.set(lum < 0.5)
+                    except Exception:
+                        pass
 
             # UI vars
             for key, var in (
@@ -670,8 +907,7 @@ class App(ThemeSupport):
                 "filter_has_attachments": bool(self.filter_has_attachments.get()),
                 "filter_has_links": bool(self.filter_has_links.get()),
                 "gallery_chat": self._gallery_selected_chat_id.get() if hasattr(self, "_gallery_selected_chat_id") else "",
-                "theme": dict(self.theme),
-                "active_theme_name": self.active_theme_name,
+                "dark_mode": bool(self.dark_mode.get()),
             }
             self._state_path.write_text(json.dumps(st, indent=2), encoding="utf-8")
         except Exception:
@@ -736,8 +972,13 @@ class App(ThemeSupport):
         filem.add_command(label="Exit", command=self.root.destroy)
 
         settings = tk.Menu(menubar, tearoff=0)
-        settings.add_command(label="Theme...", command=self._open_theme_dialog)
-        settings.add_command(label="Reset theme", command=self._reset_theme)
+        settings.add_checkbutton(
+            label="Dark mode",
+            onvalue=True,
+            offvalue=False,
+            variable=self.dark_mode,
+            command=self._on_toggle_dark_mode,
+        )
 
         helpm = tk.Menu(menubar, tearoff=0)
 
@@ -748,7 +989,7 @@ class App(ThemeSupport):
                 "- Browse/search Signal exports\n"
                 "- Media gallery + exports\n"
                 "- Stats + word frequency\n\n"
-                "Tip: Use Settings → Theme to customize colors/fonts.",
+                "Tip: Use Settings → Dark mode to toggle.",
                 parent=self.root,
             )
 
@@ -760,7 +1001,7 @@ class App(ThemeSupport):
         self.root.config(menu=menubar)
         self._menubar = menubar
         self._settings_menu = settings
-        self._apply_theme_to_menu()
+        self._apply_palette_to_menu()
 
     def _make_ui(self) -> None:
         self._build_menubar()
@@ -1261,7 +1502,7 @@ class App(ThemeSupport):
         preview_container.columnconfigure(0, weight=1)
         preview_container.rowconfigure(0, weight=1)
 
-        self._apply_theme_to_text(self.preview_txt)
+        self._apply_palette_to_text(self.preview_txt)
         self.preview_txt.tag_configure(
             "pv_link",
             foreground=self.theme.get("link_fg", "#8a2be2"),
@@ -1789,7 +2030,7 @@ class App(ThemeSupport):
 
         _bind_mousewheel(txt)
 
-        self._apply_theme_to_text(txt)
+        self._apply_palette_to_text(txt)
         txt.tag_configure(
             "link",
             foreground=self.theme.get("link_fg", "#8a2be2"),
@@ -2227,19 +2468,194 @@ class App(ThemeSupport):
         self._stats_status = tk.StringVar(value="Click Refresh Stats after connecting to a database.")
         ttk.Label(top, textvariable=self._stats_status).pack(side=tk.LEFT, padx=12)
 
+        # Scrollable dashboard area (replaces monospaced Text report)
         container = ttk.Frame(outer)
         container.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        self._stats_text = tk.Text(container, wrap="word", state="disabled")
-        sv = ttk.Scrollbar(container, orient="vertical", command=self._stats_text.yview)
-        self._stats_text.configure(yscrollcommand=sv.set)
-        self._stats_text.grid(row=0, column=0, sticky="nsew")
-        sv.grid(row=0, column=1, sticky="ns")
+
+        self._stats_canvas = tk.Canvas(container, bg=self.theme.get("panel_bg", "#ffffff"), highlightthickness=0, bd=0)
+        self._stats_scroll = ttk.Scrollbar(container, orient="vertical", command=self._stats_canvas.yview)
+        self._stats_canvas.configure(yscrollcommand=self._stats_scroll.set)
+
+        self._stats_canvas.grid(row=0, column=0, sticky="nsew")
+        self._stats_scroll.grid(row=0, column=1, sticky="ns")
         container.columnconfigure(0, weight=1)
         container.rowconfigure(0, weight=1)
-        self._apply_theme_to_text(self._stats_text)
-        _bind_mousewheel(self._stats_text)
+
+        self._stats_inner = ttk.Frame(self._stats_canvas)
+        self._stats_canvas.create_window((0, 0), window=self._stats_inner, anchor="nw")
+        self._stats_inner_size: tuple = (0, 0)
+        self._stats_inner.bind("<Configure>", self._on_stats_inner_configure)
+
+        self._stats_canvas.configure(yscrollincrement=17)
+        _bind_mousewheel(self._stats_canvas, speed=3)
+        _bind_mousewheel(self._stats_inner, scroll_widget=self._stats_canvas, speed=3)
+
+        # Keep text report for export
+        self._stats_report_text: str = ""
         self._stats_cloud_ref: Optional[ImageTk.PhotoImage] = None  # prevent GC
         self._stats_cloud_pil: Optional[Image.Image] = None  # PIL copy for export
+
+        # KPI font (uses default font family)
+        try:
+            self._stats_kpi_font = tkfont.nametofont("TkDefaultFont").copy()
+            self._stats_kpi_font.configure(size=int(self._stats_kpi_font.cget("size")) + 4, weight="bold")
+        except Exception:
+            self._stats_kpi_font = None
+
+    def _on_stats_inner_configure(self, _event: Any) -> None:
+        """Update stats scrollregion when inner frame size changes."""
+        try:
+            new_size = (self._stats_inner.winfo_reqwidth(), self._stats_inner.winfo_reqheight())
+            if new_size != getattr(self, "_stats_inner_size", (0, 0)):
+                self._stats_inner_size = new_size
+                self._stats_canvas.configure(scrollregion=self._stats_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _render_stats_dashboard(self, data: Dict[str, Any]) -> None:
+        """Render computed stats into the dashboard UI."""
+        inner = getattr(self, "_stats_inner", None)
+        if inner is None:
+            return
+
+        for w in inner.winfo_children():
+            w.destroy()
+
+        th = self.theme
+
+        def _kpi(parent: ttk.Frame, title: str, value: str, subtitle: str = "") -> ttk.Labelframe:
+            lf = ttk.Labelframe(parent, text=title, padding=10)
+            v = ttk.Label(lf, text=value)
+            kpi_font = getattr(self, "_stats_kpi_font", None)
+            if kpi_font is not None:
+                try:
+                    v.configure(font=kpi_font)
+                except Exception:
+                    pass
+            v.pack(anchor="w")
+            if subtitle:
+                ttk.Label(lf, text=subtitle, foreground=th.get("meta_fg", "#666666")).pack(anchor="w", pady=(4, 0))
+            return lf
+
+        def _bar_list(parent: ttk.Frame, title: str, items: list[tuple[str, int]], max_rows: int | None = None) -> None:
+            lf = ttk.Labelframe(parent, text=title, padding=10)
+            lf.pack(fill=tk.BOTH, expand=True)
+            if not items:
+                ttk.Label(lf, text="No data").pack(anchor="w")
+                return
+            mx = max((c for _l, c in items), default=1) or 1
+            rows = items if max_rows is None else items[:max_rows]
+            for lbl, cnt in rows:
+                row = ttk.Frame(lf)
+                row.pack(fill=tk.X, pady=2)
+                ttk.Label(row, text=lbl, width=10).pack(side=tk.LEFT)
+                pb = ttk.Progressbar(row, orient="horizontal", mode="determinate", maximum=mx, value=cnt)
+                pb.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+                ttk.Label(row, text=f"{cnt:,}", width=10, anchor="e").pack(side=tk.RIGHT)
+
+        def _table(parent: ttk.Frame, title: str, cols: list[tuple[str, str, int]], rows: list[tuple[Any, ...]], height: int = 8) -> None:
+            lf = ttk.Labelframe(parent, text=title, padding=10)
+            lf.pack(fill=tk.BOTH, expand=True)
+            if not rows:
+                ttk.Label(lf, text="No data").pack(anchor="w")
+                return
+            wrap = ttk.Frame(lf)
+            wrap.pack(fill=tk.BOTH, expand=True)
+            col_ids = [c[0] for c in cols]
+            tv = ttk.Treeview(wrap, columns=col_ids, show="headings", height=height)
+            vs = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview)
+            tv.configure(yscrollcommand=vs.set)
+            tv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            vs.pack(side=tk.RIGHT, fill=tk.Y)
+            for cid, heading, w in cols:
+                tv.heading(cid, text=heading)
+                tv.column(cid, width=w, anchor="w")
+            for r in rows:
+                tv.insert("", tk.END, values=tuple(r))
+            _bind_mousewheel(tv)
+
+        # --- KPI row ---
+        kpi_row = ttk.Frame(inner)
+        kpi_row.pack(fill=tk.X, pady=(0, 10))
+        for i in range(4):
+            kpi_row.columnconfigure(i, weight=1)
+
+        ov = data.get("overview", {})
+        _kpi(kpi_row, "Messages", ov.get("msg_count", "0"), f"Sent {ov.get('outgoing', '0')} · Recv {ov.get('incoming', '0')}").grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        _kpi(kpi_row, "Chats", ov.get("chat_count", "0"), f"Recipients {ov.get('recip_count', '0')}").grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+        _kpi(kpi_row, "Attachments", ov.get("att_count", "0"), f"Resolved {ov.get('att_resolved', '0')} ({ov.get('att_pct', 'n/a')})").grid(row=0, column=2, sticky="nsew", padx=(0, 8))
+        _kpi(kpi_row, "Database", ov.get("db_size", "?"), ov.get("db_name", "")).grid(row=0, column=3, sticky="nsew")
+
+        # --- Date range + Extras ---
+        mid = ttk.Frame(inner)
+        mid.pack(fill=tk.X, pady=(0, 10))
+        mid.columnconfigure(0, weight=1)
+        mid.columnconfigure(1, weight=1)
+
+        dr = data.get("date_range")
+        dr_lf = ttk.Labelframe(mid, text="Date Range", padding=10)
+        dr_lf.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        if dr:
+            ttk.Label(dr_lf, text=f"First: {dr.get('first','')}").pack(anchor="w")
+            ttk.Label(dr_lf, text=f"Last:  {dr.get('last','')}").pack(anchor="w")
+            if dr.get("span_days") is not None:
+                ttk.Label(dr_lf, text=f"Span:  {dr.get('span_days'):,} days").pack(anchor="w")
+                if dr.get("avg_per_day") is not None:
+                    ttk.Label(dr_lf, text=f"Avg:   {dr.get('avg_per_day'):.1f} msgs/day").pack(anchor="w")
+        else:
+            ttk.Label(dr_lf, text="No dated messages found").pack(anchor="w")
+
+        ex = data.get("extras")
+        ex_lf = ttk.Labelframe(mid, text="Extras", padding=10)
+        ex_lf.grid(row=0, column=1, sticky="nsew")
+        if ex:
+            for k, v in ex:
+                ttk.Label(ex_lf, text=f"{k}: {v}").pack(anchor="w")
+        else:
+            ttk.Label(ex_lf, text="—").pack(anchor="w")
+
+        # --- Activity bars ---
+        bars = ttk.Frame(inner)
+        bars.pack(fill=tk.X, pady=(0, 10))
+        bars.columnconfigure(0, weight=1)
+        bars.columnconfigure(1, weight=1)
+
+        left = ttk.Frame(bars)
+        right = ttk.Frame(bars)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        right.grid(row=0, column=1, sticky="nsew")
+        _bar_list(left, "Busiest Months", data.get("monthly", []), max_rows=12)
+        _bar_list(right, "Messages by Hour (Local)", data.get("hod", []), max_rows=None)
+
+        bars2 = ttk.Frame(inner)
+        bars2.pack(fill=tk.X, pady=(0, 10))
+        bars2.columnconfigure(0, weight=1)
+        bars2.columnconfigure(1, weight=1)
+        left2 = ttk.Frame(bars2)
+        right2 = ttk.Frame(bars2)
+        left2.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        right2.grid(row=0, column=1, sticky="nsew")
+        _bar_list(left2, "Messages by Day of Week", data.get("dow", []), max_rows=7)
+        _bar_list(right2, "Messages by Year", data.get("yearly", []), max_rows=None)
+
+        # --- Tables ---
+        _table(inner, "Top Conversations", [("name", "Name", 320), ("cnt", "Messages", 100), ("chat", "Chat ID", 80)], data.get("top_chats", []), height=10)
+        _table(inner, "Attachments by Type", [("kind", "Kind", 120), ("cnt", "Files", 80), ("size", "Total Size", 120)], data.get("att_kinds", []), height=8)
+        _table(inner, "Top MIME Types", [("mime", "MIME", 360), ("cnt", "Files", 80)], data.get("top_mime", []), height=8)
+        _table(inner, "Largest Files", [("size", "Size", 100), ("kind", "Kind", 90), ("name", "Name", 420)], data.get("big_files", []), height=8)
+
+        _table(inner, "Top Shared Domains", [("dom", "Domain", 420), ("cnt", "Count", 80)], data.get("top_domains", []), height=8)
+        _table(inner, "Top Emojis", [("emoji", "Emoji", 120), ("cnt", "Count", 80)], data.get("top_emoji", []), height=6)
+
+        # --- Word cloud ---
+        wc = ttk.Labelframe(inner, text="Word Cloud", padding=10)
+        wc.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        cloud = data.get("cloud_img")
+        if cloud is not None:
+            lbl = ttk.Label(wc, image=cloud)
+            lbl.pack(anchor="center")
+        else:
+            ttk.Label(wc, text="No word cloud data").pack(anchor="w")
 
     def _generate_word_cloud(self, word_freq: list[tuple[str, int]], width: int = 800, height: int = 400) -> Optional[ImageTk.PhotoImage]:
         """Generate a word cloud image from (word, count) pairs using PIL only."""
@@ -2710,34 +3126,84 @@ class App(ThemeSupport):
 
         report = "\n".join(lines)
 
-        # Render into Text widget
-        self._stats_text.configure(state="normal")
-        self._stats_text.delete("1.0", tk.END)
+        # Keep text report for export (Text widget previously omitted images anyway)
+        self._stats_report_text = report.replace("<<WORDCLOUD>>", "").strip()
 
-        # Split on word cloud placeholder to embed image
-        parts = report.split("<<WORDCLOUD>>")
-        self._stats_text.insert(tk.END, parts[0])
+        # Prepare dashboard data
+        data: Dict[str, Any] = {
+            "overview": {
+                "db_name": db_path.name,
+                "db_size": db_size,
+                "msg_count": f"{msg_count:,}",
+                "chat_count": f"{chat_count:,}",
+                "recip_count": f"{recip_count:,}",
+                "att_count": f"{att_count:,}",
+                "att_resolved": f"{att_resolved:,}",
+                "att_pct": att_pct,
+                "outgoing": f"{outgoing:,}",
+                "incoming": f"{incoming:,}",
+            },
+            "monthly": [(r[0], int(r[1])) for r in monthly] if monthly else [],
+            "dow": [(r[0], int(r[1])) for r in dow] if dow else [],
+            "hod": [(f"{int(r[0]):02d}:00", int(r[1])) for r in hod] if hod else [],
+            "yearly": [(r[0], int(r[1])) for r in yearly] if yearly else [],
+            "top_chats": [(r[1], int(r[2]), int(r[0])) for r in top_chats] if top_chats else [],
+            "att_kinds": [(r[0], int(r[1]), _human_size(r[2] or 0)) for r in att_kinds] if att_kinds else [],
+            "top_mime": [(r[0], int(r[1])) for r in top_mime] if top_mime else [],
+            "big_files": [(_human_size(r[1] or 0), r[2] or "?", (r[0] or "(unnamed)")) for r in big_files] if big_files else [],
+            "top_domains": [(d, int(c)) for d, c in (sorted(domain_counts.items(), key=lambda x: -x[1])[:15] if domain_counts else [])],
+            "top_emoji": [(e, int(c)) for e, c in (sorted(emoji_counts.items(), key=lambda x: -x[1])[:20] if emoji_counts else [])],
+        }
 
-        if len(parts) > 1:
-            # Generate and insert word cloud image
+        if first_date and last_date:
+            dr: Dict[str, Any] = {"first": str(first_date)[:19], "last": str(last_date)[:19]}
             try:
-                cloud_img = self._generate_word_cloud(top_combined, width=800, height=400)
-                if cloud_img:
-                    self._stats_cloud_ref = cloud_img
-                    self._stats_text.image_create(tk.END, image=cloud_img)
-                    self._stats_text.insert(tk.END, "\n")
+                d1 = datetime.fromisoformat(str(first_date))
+                d2 = datetime.fromisoformat(str(last_date))
+                span_days = (d2 - d1).days
+                dr["span_days"] = span_days
+                if msg_count and span_days > 0:
+                    dr["avg_per_day"] = msg_count / span_days
             except Exception:
-                self._stats_text.insert(tk.END, "  (word cloud generation failed)\n")
-            self._stats_text.insert(tk.END, parts[1])
+                pass
+            data["date_range"] = dr
 
-        self._stats_text.configure(state="disabled")
+        extras_pairs: list[tuple[str, str]] = []
+        if msg_count:
+            try:
+                extras_pairs.append(("Links", f"{link_count:,} ({(link_count * 100 / msg_count):.1f}%)"))
+            except Exception:
+                extras_pairs.append(("Links", f"{link_count:,}"))
+            msgs_with_att = _q1("SELECT COUNT(DISTINCT message_rowid) FROM attachments") or 0
+            try:
+                extras_pairs.append(("Msgs w/ attachments", f"{msgs_with_att:,} ({(msgs_with_att * 100 / msg_count):.1f}%)"))
+            except Exception:
+                extras_pairs.append(("Msgs w/ attachments", f"{msgs_with_att:,}"))
+            if opener_rows:
+                total_openers = sum(r[1] for r in opener_rows)
+                for who, cnt in opener_rows:
+                    pct = cnt * 100 / total_openers if total_openers else 0
+                    extras_pairs.append((f"Opener: {who}", f"{cnt:,} ({pct:.1f}%)"))
+            data["extras"] = extras_pairs
+
+        # Word cloud image for dashboard
+        cloud_img = None
+        try:
+            cloud_img = self._generate_word_cloud(top_combined, width=900, height=420)
+            if cloud_img:
+                self._stats_cloud_ref = cloud_img
+        except Exception:
+            cloud_img = None
+        data["cloud_img"] = cloud_img
+
+        self._render_stats_dashboard(data)
         self._stats_status.set(f"Stats loaded — {msg_count:,} messages, {chat_count:,} chats")
 
     # ---------- Export Stats ----------
 
     def _export_stats(self) -> None:
         """Export the current Stats tab content as HTML or plain text."""
-        txt = self._stats_text.get("1.0", tk.END).strip()
+        txt = (getattr(self, "_stats_report_text", "") or "").strip()
         if not txt:
             messagebox.showwarning("No stats", "Refresh Stats first.")
             return
