@@ -388,6 +388,7 @@ class App:
 
         self._state_path = Path.cwd() / "app_state.json"
         self._themes_path = Path.cwd() / "themes.json"
+        self._cache_state_path = Path.cwd() / "cache_state.json"
 
         self.theme: Dict[str, Any] = self._default_theme()
         self.active_theme_name: str = ""
@@ -1787,6 +1788,16 @@ class App:
         ttk.Button(btn_row, text="Use DB for Search", command=self._use_built_db).pack(side=tk.LEFT, padx=8)
         row += 1
 
+        # --- Global cache row ---
+        cache_row = ttk.Frame(frm)
+        cache_row.grid(row=row, column=0, columnspan=3, sticky="we", pady=(12, 0))
+        ttk.Button(cache_row, text="\u26a1 Build All Cache", command=self._build_all_cache).pack(side=tk.LEFT)
+        ttk.Button(cache_row, text="Clear Cache", command=self._clear_cache).pack(side=tk.LEFT, padx=8)
+        self._cache_status_var = tk.StringVar(value="")
+        ttk.Label(cache_row, textvariable=self._cache_status_var, foreground="gray").pack(side=tk.LEFT, padx=12)
+        self._refresh_cache_status()
+        row += 1
+
         ttk.Separator(frm).grid(row=row, column=0, columnspan=3, sticky="we", pady=12)
         row += 1
 
@@ -1811,6 +1822,157 @@ class App:
     def _log(self, msg: str) -> None:
         self.build_log.insert(tk.END, msg + "\n")
         self.build_log.see(tk.END)
+
+    # ---------- Cache state persistence ----------
+
+    def _load_cache_state(self) -> Dict[str, Any]:
+        try:
+            import json
+            if self._cache_state_path.exists():
+                return json.loads(self._cache_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_cache_state(self, updates: Dict[str, Any]) -> None:
+        import json
+        st = self._load_cache_state()
+        st.update(updates)
+        try:
+            self._cache_state_path.write_text(json.dumps(st, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _refresh_cache_status(self) -> None:
+        """Update the cache status label from cache_state.json."""
+        st = self._load_cache_state()
+        parts: List[str] = []
+        db_ts = st.get("db_built")
+        if db_ts:
+            parts.append(f"DB built {db_ts}")
+        thumb_ts = st.get("thumbs_built")
+        if thumb_ts:
+            parts.append(f"Thumbnails built {thumb_ts}")
+        if parts:
+            self._cache_status_var.set("Cache: " + " | ".join(parts))
+        else:
+            self._cache_status_var.set("Cache: not built")
+
+    def _build_all_cache(self) -> None:
+        """Build DB + thumbnail cache in one go. Persistent until cleared."""
+        if not self._build_lock.acquire(blocking=False):
+            messagebox.showwarning("Build running", "A build is already running.")
+            return
+
+        in_path = Path(self.input_jsonl.get()).expanduser()
+        out_path = Path(self.output_db.get()).expanduser()
+        store_raw = bool(self.store_raw_e164.get())
+
+        if not in_path.exists():
+            self._build_lock.release()
+            messagebox.showerror("Missing file", f"Input file not found:\n{in_path}")
+            return
+
+        self._log("=" * 72)
+        self._log("BUILD ALL CACHE — Starting")
+        self._log(f"Input:  {in_path}")
+        self._log(f"Output: {out_path}")
+        self._log("=" * 72)
+
+        def worker() -> None:
+            from datetime import datetime
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                # --- Step 1: Build DB ---
+                def log_cb(m: str) -> None:
+                    self.root.after(0, lambda: self._log(m))
+
+                # Disconnect if same DB is open
+                if self._conn is not None:
+                    try:
+                        cur_db = Path(self.db_path.get()).resolve()
+                        if cur_db == out_path.resolve():
+                            self._conn.close()
+                            self._conn = None
+                    except Exception:
+                        pass
+
+                self.root.after(0, lambda: self._cache_status_var.set("Building database…"))
+                build_signal_db.build_db(in_path, out_path, store_raw, log=log_cb)
+                self.root.after(0, lambda: self._log("DB build complete."))
+                self._save_cache_state({"db_built": now_str, "db_path": str(out_path)})
+
+                # Auto-connect so thumbnails can query attachments
+                def _auto_connect() -> None:
+                    self.db_path.set(str(out_path))
+                    self._connect()
+                self.root.after(0, _auto_connect)
+                import time; time.sleep(0.3)  # let mainloop process connect
+
+                # --- Step 2: Build thumbnail cache ---
+                self.root.after(0, lambda: self._cache_status_var.set("Building thumbnail cache…"))
+                self.root.after(0, lambda: self._log("Building thumbnail cache…"))
+                self._rebuild_thumb_cache(log_func=log_cb)
+                thumb_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._save_cache_state({"thumbs_built": thumb_ts})
+
+                self.root.after(0, lambda: self._log("BUILD ALL CACHE — Complete"))
+                self.root.after(0, lambda: self._refresh_cache_status())
+                self.root.after(0, lambda: messagebox.showinfo("Cache Built", "Database and thumbnail cache built successfully.\nCache persists until you clear or rebuild it."))
+            except Exception:
+                tb = traceback.format_exc()
+                self.root.after(0, lambda: self._log("Build All Cache failed:\n" + tb))
+                self.root.after(0, lambda: messagebox.showerror("Build failed", "Build All Cache failed. See Log."))
+            finally:
+                self.root.after(0, lambda: self._refresh_cache_status())
+                self._build_lock.release()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _clear_cache(self) -> None:
+        """Clear thumbnail cache and optionally the DB. Resets cache_state.json."""
+        choice = messagebox.askyesnocancel(
+            "Clear Cache",
+            "Clear the persistent cache?\n\n"
+            "YES  = Clear thumbnails + DB\n"
+            "NO   = Clear thumbnails only\n"
+            "CANCEL = Do nothing",
+        )
+        if choice is None:
+            return
+
+        # Always clear thumbnails + in-memory photo cache
+        cache_dir = self._thumb_cache_dir()
+        try:
+            shutil.rmtree(str(cache_dir), ignore_errors=True)
+        except Exception:
+            pass
+        self._clear_photo_cache()
+        self._log("Thumbnail cache cleared.")
+        updates: Dict[str, Any] = {"thumbs_built": None}
+
+        if choice:  # YES — also remove DB
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+                self.status_var.set("Disconnected")
+            db_path = Path(self.output_db.get()).expanduser()
+            if db_path.exists():
+                try:
+                    db_path.unlink()
+                    self._log(f"Deleted DB: {db_path}")
+                except Exception as e:
+                    self._log(f"Could not delete DB: {e}")
+            updates["db_built"] = None
+            updates["db_path"] = None
+
+        # Reset cache state
+        self._save_cache_state(updates)
+        self._refresh_cache_status()
+        self._log("Cache cleared.")
 
     def _rebuild_db(self) -> None:
         """Rebuild the DB using the same input/output paths. Convenience shortcut."""
@@ -1875,7 +2037,10 @@ class App:
                     self.root.after(0, lambda: self._log(m))
 
                 build_signal_db.build_db(in_path, out_path, store_raw, log=log_cb)
+                from datetime import datetime as _dt
+                self._save_cache_state({"db_built": _dt.now().strftime("%Y-%m-%d %H:%M:%S"), "db_path": str(out_path)})
                 self.root.after(0, lambda: self._log("Build complete"))
+                self.root.after(0, lambda: self._refresh_cache_status())
                 self.root.after(0, lambda: messagebox.showinfo("Build complete", f"DB created:\n{out_path}"))
             except Exception:
                 tb = traceback.format_exc()
@@ -2847,7 +3012,10 @@ class App:
             def log_cb(msg: str) -> None:
                 self.root.after(0, lambda: self.export_status.set(msg))
             self._rebuild_thumb_cache(log_func=log_cb)
+            from datetime import datetime as _dt
+            self._save_cache_state({"thumbs_built": _dt.now().strftime("%Y-%m-%d %H:%M:%S")})
             self.root.after(0, lambda: self.export_status.set("Thumbnail cache rebuilt."))
+            self.root.after(0, lambda: self._refresh_cache_status())
             # Refresh gallery if a chat is loaded
             try:
                 chat_id = self._safe_int(self._gallery_selected_chat_id.get())

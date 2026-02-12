@@ -16,4 +16,5 @@ files/
 # App user state / cache
 app_state.json
 theme.json
+cache_state.json
 .thumbcache/
