@@ -272,6 +272,43 @@ def _fts_terms(q: str) -> List[str]:
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
+# Matches http / https URLs in message bodies.
+_URL_RE = re.compile(r'https?://[^\s<>\"\')\]]+')
+
+
+def _insert_body_with_links(
+    txt: "tk.Text",
+    body: str,
+    link_idx_ref: List[int],
+    link_tag: str = "link",
+) -> None:
+    """Insert *body* into *txt*, turning URLs into clickable hyperlinks."""
+    last = 0
+    for m in _URL_RE.finditer(body):
+        # plain text before this URL
+        if m.start() > last:
+            txt.insert(tk.END, body[last : m.start()])
+        url = m.group(0)
+        # strip trailing punctuation that is unlikely part of the URL
+        while url and url[-1] in (".", ",", ";", ":", "!", "?", ")", "]"):
+            url = url[:-1]
+        s = txt.index(tk.END)
+        txt.insert(tk.END, url)
+        e = txt.index(tk.END)
+        txt.tag_add(link_tag, s, e)
+        tag = f"{link_tag}_{link_idx_ref[0]}"
+        link_idx_ref[0] += 1
+        txt.tag_add(tag, s, e)
+        txt.tag_bind(tag, "<Button-1>", lambda _e, u=url: webbrowser.open(u))
+        # insert any stripped trailing chars as plain text
+        stripped = body[m.start() + len(url) : m.end()]
+        if stripped:
+            txt.insert(tk.END, stripped)
+        last = m.end()
+    # remaining text after last URL
+    if last < len(body):
+        txt.insert(tk.END, body[last:])
+
 
 def _is_hex_color(s: Any) -> bool:
     return isinstance(s, str) and bool(_HEX_COLOR_RE.match(s.strip()))
@@ -2393,20 +2430,19 @@ class App:
 
         # Keep image references alive for inline thumbnails
         self._preview_img_refs: List[Any] = []
-        link_idx = 0
+        link_idx_ref: List[int] = [0]
 
         msg_ids = [int(m["rowid"]) for m in rows]
         authors = self._speaker_names_for_message_ids(msg_ids)
         atts_by_msg = self._batch_fetch_attachments(msg_ids)
 
         def add_link(label: str, path: str) -> None:
-            nonlocal link_idx
             s = self.preview_txt.index(tk.END)
             self.preview_txt.insert(tk.END, label)
             e = self.preview_txt.index(tk.END)
             self.preview_txt.tag_add("pv_link", s, e)
-            tag = f"pv_link_{link_idx}"
-            link_idx += 1
+            tag = f"pv_link_{link_idx_ref[0]}"
+            link_idx_ref[0] += 1
             self.preview_txt.tag_add(tag, s, e)
             self.preview_txt.tag_bind(tag, "<Button-1>", lambda _e, p=path: _safe_open_path(p))
             self.preview_txt.tag_bind(tag, "<Button-3>", lambda _e, p=path: self._attachment_context_menu(_e, p))
@@ -2422,7 +2458,7 @@ class App:
             s = self.preview_txt.index(tk.END)
             self.preview_txt.insert(tk.END, f"[{ts}] ", ("meta",))
             self.preview_txt.insert(tk.END, f"{who}: ", (tag,))
-            self.preview_txt.insert(tk.END, body)
+            _insert_body_with_links(self.preview_txt, body, link_idx_ref, "pv_link")
             e = self.preview_txt.index(tk.END)
             ranges[mid] = (s, e)
 
@@ -2569,16 +2605,15 @@ class App:
         authors = self._speaker_names_for_message_ids(msg_ids)
 
         ranges: Dict[int, Tuple[str, str]] = {}
-        link_idx = 0
+        link_idx_ref: List[int] = [0]
 
         def add_link(label: str, path: str) -> None:
-            nonlocal link_idx
             s = txt.index(tk.END)
             txt.insert(tk.END, label)
             e = txt.index(tk.END)
             txt.tag_add("link", s, e)
-            tag = f"link_{link_idx}"
-            link_idx += 1
+            tag = f"link_{link_idx_ref[0]}"
+            link_idx_ref[0] += 1
             txt.tag_add(tag, s, e)
             txt.tag_bind(tag, "<Button-1>", lambda _e, p=path: _safe_open_path(p))
             txt.tag_bind(tag, "<Button-3>", lambda _e, p=path: self._attachment_context_menu(_e, p))
@@ -2593,7 +2628,7 @@ class App:
             s = txt.index(tk.END)
             txt.insert(tk.END, f"[{ts}] ", ("meta",))
             txt.insert(tk.END, f"{who}: ", (wtag,))
-            txt.insert(tk.END, body)
+            _insert_body_with_links(txt, body, link_idx_ref, "link")
             e = txt.index(tk.END)
             ranges[mid] = (s, e)
 
