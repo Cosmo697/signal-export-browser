@@ -1767,8 +1767,13 @@ class App:
             self.output_db.set(p)
 
     def _use_built_db(self) -> None:
-        self.db_path.set(self.output_db.get())
-        messagebox.showinfo("DB Path Set", "Search & Threads tab will use this DB. Click Connect there.")
+        db = self.output_db.get()
+        if not db or not Path(db).expanduser().exists():
+            messagebox.showerror("Missing DB", f"DB not found:\n{db}")
+            return
+        self.db_path.set(db)
+        if self._connect():
+            self.nb.select(1)  # Switch to Search & Threads tab
 
     def _start_build(self) -> None:
         if not self._build_lock.acquire(blocking=False):
