@@ -1236,7 +1236,7 @@ class App:
         if self._conn is None or not message_ids:
             return {}
         placeholders = ",".join(["?"] * len(message_ids))
-        q = f"SELECT message_rowid, authorName, outgoing FROM messages_enriched WHERE message_rowid IN ({placeholders})"
+        q = f"SELECT message_rowid, authorName, recipientName, outgoing FROM messages_enriched WHERE message_rowid IN ({placeholders})"
         author_rows = self._conn.execute(q, tuple(message_ids)).fetchall()
         out: Dict[int, str] = {}
         for r in author_rows:
@@ -1245,6 +1245,8 @@ class App:
                 out[mid] = "You"
             else:
                 nm = (r["authorName"] or "").strip()
+                if not nm:
+                    nm = (r["recipientName"] or "").strip()
                 out[mid] = nm or "Them"
         return out
 
@@ -2562,7 +2564,9 @@ class App:
         win.bind("<Destroy>", lambda e: _prune_open_thread_texts() if e.widget is win else None)
 
         win._img_refs = []  # type: ignore[attr-defined]
-        atts_by_msg = self._batch_fetch_attachments([int(m["rowid"]) for m in msgs])
+        msg_ids = [int(m["rowid"]) for m in msgs]
+        atts_by_msg = self._batch_fetch_attachments(msg_ids)
+        authors = self._speaker_names_for_message_ids(msg_ids)
 
         ranges: Dict[int, Tuple[str, str]] = {}
         link_idx = 0
@@ -2581,7 +2585,7 @@ class App:
 
         for m in msgs:
             mid = int(m["rowid"])
-            who = "YOU" if m["outgoing"] else "THEM"
+            who = authors.get(mid) or ("You" if m["outgoing"] else recipient_name)
             wtag = "you" if m["outgoing"] else "them"
             ts = _fmt_ts_short(m["dateSentIso"] or "")
             body = m["body"] or ""
@@ -3711,10 +3715,13 @@ class App:
             "</style>"
         )
         out.append(f"<h2>Thread: {esc(rname)} (chatId={chat_id})</h2>")
-        atts_by_msg = self._batch_fetch_attachments([int(m["rowid"]) for m in msgs])
+        msg_ids = [int(m["rowid"]) for m in msgs]
+        atts_by_msg = self._batch_fetch_attachments(msg_ids)
+        authors = self._speaker_names_for_message_ids(msg_ids)
 
         for m in msgs:
-            who = "YOU" if m["outgoing"] else "THEM"
+            mid = int(m["rowid"])
+            who = authors.get(mid) or ("You" if m["outgoing"] else rname)
             cls = "you" if m["outgoing"] else "them"
             out.append(f"<div class='msg'><div class='meta'>{esc(m['dateSentIso'])} <span class='{cls}'>{who}</span></div><div><code>{esc(m['body'])}</code></div>")
             atts = atts_by_msg.get(int(m["rowid"]), [])
@@ -3793,9 +3800,12 @@ class App:
         ).fetchall()
 
         lines = [f"# Thread: {rname} (chatId={chat_id})", ""]
-        atts_by_msg = self._batch_fetch_attachments([int(m["rowid"]) for m in msgs])
+        msg_ids = [int(m["rowid"]) for m in msgs]
+        atts_by_msg = self._batch_fetch_attachments(msg_ids)
+        authors = self._speaker_names_for_message_ids(msg_ids)
         for m in msgs:
-            who = "YOU" if m["outgoing"] else "THEM"
+            mid = int(m["rowid"])
+            who = authors.get(mid) or ("You" if m["outgoing"] else rname)
             lines.append(f"## {m['dateSentIso']} {who}")
             if m["body"]:
                 lines.append(m["body"])
