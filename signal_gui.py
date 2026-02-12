@@ -43,74 +43,35 @@ import tkinter.font as tkfont
 
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 
+# Split-out helpers/constants (keeps this file focused on the app)
+from gui_utils import (
+    _best_bw_for_bg,
+    _bind_mousewheel,
+    _contrast_ratio,
+    _fmt_ts_local_iso,
+    _fmt_ts_short,
+    _fts5_available,
+    _fts_terms,
+    _hex_to_rgb,
+    _human_size,
+    _insert_body_with_links,
+    _is_hex_color,
+    _lift_or_drop,
+    _normalize_date,
+    _rgb_to_hex,
+    _safe_open_path,
+    _shift_toward,
+    _table_exists,
+)
+from stop_words import STOP_WORDS as _STOP_WORDS
+
+# Theming (presets, dialog, ttk styling)
+from theming import ThemeSupport
+
 import build_signal_db
 
-# ---------------------------------------------------------------------------
-# Stop words — complete NLTK English (178 surface forms → 152 unique after
-# apostrophe removal) + contractions + common English + chat filler.
-#
-# The tokeniser strips apostrophes (replace("'","")) before lookup, so every
-# contracted form is stored WITHOUT the apostrophe (e.g. "don't" → "dont").
-# ---------------------------------------------------------------------------
-_STOP_WORDS: frozenset[str] = frozenset(
-    # ── NLTK english stop words (complete, 178 entries) ──────────────────
-    # Source: nltk.corpus.stopwords.words("english")  — NLTK 3.9.1
-    # Apostrophe forms listed separately after the base words.
-    "i me my myself we our ours ourselves you your yours yourself yourselves "
-    "he him his himself she her hers herself it its itself they them their "
-    "theirs themselves what which who whom this that these those "
-    "am is are was were be been being have has had having "
-    "do does did doing a an the and but if or because as until while "
-    "of at by for with about against between through during before after "
-    "above below to from up down in out on off over under "
-    "again further then once here there when where why how "
-    "all any both each few more most other some such "
-    "no nor not only own same so than too very "
-    "s t can will just don should now d ll m o re ve y "
-    "ain aren couldn didn doesn hadn hasn haven isn ma "
-    "mightn mustn needn shan shouldn wasn weren won wouldn "
-    # NLTK words that are only present as apostrophe forms:
-    #   don't  should've  aren't  couldn't  didn't  doesn't  hadn't
-    #   hasn't  haven't  isn't  mightn't  mustn't  needn't  shan't
-    #   shouldn't  wasn't  weren't  won't  wouldn't  it's  she's
-    #   that'll  you're  you've  you'll  you'd
-    # After apostrophe stripping these become:
-    "dont shouldve arent couldnt didnt doesnt hadnt hasnt havent isnt "
-    "mightnt mustnt neednt shant shouldnt wasnt werent wont wouldnt "
-    "its shes thatll youre youve youll youd "
-    # ── Extra modals (not in NLTK but fundamental) ───────────────────────
-    "could would might must shall may "
-    # ── Common contractions beyond NLTK ──────────────────────────────────
-    "im hes theyre ive weve theyve ill hell shell well theyll "
-    "cant cannot lets thats whos whats heres theres "
-    "wheres whens whys hows aint "
-    # ── Very-common English verbs / function words ───────────────────────
-    "also got get getting gets still really actually already always "
-    "never ever since much many way back new old make made makes making "
-    "take took takes taking come came comes coming give gave gives giving "
-    "think thought thinks thinking know knew knows knowing look looked looks "
-    "looking want wanted wants wanting say said says saying tell told tells "
-    "telling try tried tries trying use used uses using find found finds "
-    "need needed needs needing feel felt feels feeling leave left leaves "
-    "call called calls put keep keeps kept let run going gone went "
-    "even though another thing things people time day good first "
-    "last long great little own big small right well next around "
-    "work may part something anything nothing everything someone anyone "
-    "everyone two one three four five six seven eight nine ten "
-    "see saw seen hear heard lot sure enough kind "
-    # ── Chat / texting filler ────────────────────────────────────────────
-    "like yeah yes yep yup nope nah ok okay lol haha hahaha hehe "
-    "lmao lmfao omg omfg idk tbh imo imho btw brb ttyl "
-    "gonna wanna gotta kinda sorta ya yea hey hi hello "
-    "bye thanks thank please sorry wow oh ooh ahh hmm umm "
-    "maybe probably definitely literally actually basically seriously "
-    "pretty really just like well anyway "
-    # ── Messaging / generic filler ───────────────────────────────────────
-    "into set send sent stuff man dude cool shit "
-    # ── URL fragments ────────────────────────────────────────────────────
-    "http https www com org net".split()
-)
-
+# Bump this value to invalidate the thumbnail cache key.
+_THUMB_CACHE_VERSION = 3
 
 @dataclass
 class SearchParams:
@@ -125,289 +86,7 @@ class SearchParams:
     has_links: bool = False
 
 
-def _normalize_date(s: str) -> str | None:
-    s = (s or "").strip()
-    if not s:
-        return None
-    try:
-        dt = datetime.fromisoformat(s)
-        return dt.date().isoformat()
-    except Exception:
-        if len(s) == 10 and s[4] == "-" and s[7] == "-":
-            return s
-    return None
-
-
-def _fmt_ts_short(iso: str) -> str:
-    """Format an ISO timestamp as YYMMDD-HH:MM:SS in local time (24h)."""
-    s = (iso or "").strip()
-    if not s:
-        return ""
-    try:
-        # Support common forms: ...+00:00 or ...Z
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is not None:
-            # Convert aware timestamps to local timezone.
-            dt = dt.astimezone()
-        return dt.strftime("%y%m%d-%H:%M:%S")
-    except Exception:
-        return iso
-
-
-def _fmt_ts_local_iso(iso: str, ms: Any = None) -> str:
-    """Format a message timestamp as a local-time ISO string (seconds precision).
-
-    Prefers *ms* (epoch milliseconds) when provided; falls back to parsing *iso*.
-    """
-    if ms is not None:
-        try:
-            dt = datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc).astimezone()
-            return dt.isoformat(timespec="seconds")
-        except Exception:
-            pass
-
-    s = (iso or "").strip()
-    if not s:
-        return ""
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is not None:
-            dt = dt.astimezone()
-        return dt.isoformat(timespec="seconds") if hasattr(dt, "isoformat") else str(dt)
-    except Exception:
-        return iso
-
-
-def _fts5_available(conn: sqlite3.Connection) -> bool:
-    try:
-        conn.execute("CREATE VIRTUAL TABLE temp.__fts5_test USING fts5(x)")
-        conn.execute("DROP TABLE temp.__fts5_test")
-        return True
-    except sqlite3.OperationalError:
-        return False
-
-
-def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    r = conn.execute("SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=?", (name,)).fetchone()
-    return r is not None
-
-
-def _safe_open_path(path: str) -> None:
-    if not path:
-        return
-    try:
-        if os.name == "nt":
-            os.startfile(path)  # type: ignore[attr-defined]
-            return
-        if sys.platform == "darwin":
-            import subprocess
-            subprocess.Popen(["open", path])
-            return
-        import subprocess
-        subprocess.Popen(["xdg-open", path])
-        return
-    except Exception:
-        pass
-    try:
-        webbrowser.open(f"file:///{path}")
-    except Exception:
-        pass
-
-
-def _bind_mousewheel(widget: tk.Widget, scroll_widget: Optional[tk.Widget] = None, speed: int = 1) -> None:
-    """Enable mouse wheel scrolling when the cursor is over widget.
-
-    Works for common Tk widgets that implement yview_scroll (Text, Canvas, Treeview, etc.).
-    *speed* multiplies each scroll step (default 1; use e.g. 3 for gallery canvases).
-    """
-    target = scroll_widget or widget
-
-    def _yview_scroll(delta_lines: int) -> None:
-        try:
-            target.yview_scroll(delta_lines, "units")  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-    def on_mousewheel(event) -> str:
-        # Windows/macOS: event.delta (typically multiples of 120 on Windows)
-        delta = getattr(event, "delta", 0) or 0
-        if delta:
-            step = -1 if delta > 0 else 1
-            # Scale for high-resolution wheels; keep it simple.
-            lines = step * max(1, int(abs(delta) / 120)) * speed
-            _yview_scroll(lines)
-            return "break"
-
-        # X11: Button-4 / Button-5
-        num = getattr(event, "num", None)
-        if num == 4:
-            _yview_scroll(-1 * speed)
-            return "break"
-        if num == 5:
-            _yview_scroll(1 * speed)
-            return "break"
-        return "break"
-
-    widget.bind("<MouseWheel>", on_mousewheel)
-    widget.bind("<Button-4>", on_mousewheel)
-    widget.bind("<Button-5>", on_mousewheel)
-
-
-def _human_size(n: Optional[int]) -> str:
-    if not n:
-        return ""
-    n = int(n)
-    if n < 1024:
-        return f"{n} B"
-    if n < 1024 * 1024:
-        return f"{n/1024:.1f} KB"
-    if n < 1024 * 1024 * 1024:
-        return f"{n/1024/1024:.1f} MB"
-    return f"{n/1024/1024/1024:.1f} GB"
-
-
-def _fts_terms(q: str) -> List[str]:
-    q = q.strip()
-    if not q:
-        return []
-    parts = re.findall(r'"([^"]+)"|(\S+)', q)
-    tokens: List[str] = []
-    for a, b in parts:
-        t = a or b
-        if not t:
-            continue
-        t = t.strip()
-        if t.upper() in ("OR", "AND", "NOT", "NEAR"):
-            continue
-        t = re.sub(r"[^0-9A-Za-z_]+", "", t)
-        if t:
-            tokens.append(t)
-    seen = set()
-    out: List[str] = []
-    for t in tokens:
-        tl = t.lower()
-        if tl in seen:
-            continue
-        seen.add(tl)
-        out.append(t)
-    return out[:20]
-
-
-_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-
-# Matches http / https URLs in message bodies.
-_URL_RE = re.compile(r'https?://[^\s<>\"\')\]]+')
-
-
-def _insert_body_with_links(
-    txt: "tk.Text",
-    body: str,
-    link_idx_ref: List[int],
-    link_tag: str = "link",
-) -> None:
-    """Insert *body* into *txt*, turning URLs into clickable hyperlinks."""
-    last = 0
-    for m in _URL_RE.finditer(body):
-        # plain text before this URL
-        if m.start() > last:
-            txt.insert(tk.END, body[last : m.start()])
-        url = m.group(0)
-        # strip trailing punctuation that is unlikely part of the URL
-        while url and url[-1] in (".", ",", ";", ":", "!", "?", ")", "]"):
-            url = url[:-1]
-        s = txt.index(tk.END)
-        txt.insert(tk.END, url)
-        e = txt.index(tk.END)
-        txt.tag_add(link_tag, s, e)
-        tag = f"{link_tag}_{link_idx_ref[0]}"
-        link_idx_ref[0] += 1
-        txt.tag_add(tag, s, e)
-        txt.tag_bind(tag, "<Button-1>", lambda _e, u=url: webbrowser.open(u))
-        # insert any stripped trailing chars as plain text
-        stripped = body[m.start() + len(url) : m.end()]
-        if stripped:
-            txt.insert(tk.END, stripped)
-        last = m.end()
-    # remaining text after last URL
-    if last < len(body):
-        txt.insert(tk.END, body[last:])
-
-
-def _is_hex_color(s: Any) -> bool:
-    return isinstance(s, str) and bool(_HEX_COLOR_RE.match(s.strip()))
-
-
-def _hex_to_rgb(hexv: str) -> Tuple[int, int, int]:
-    h = hexv.strip().lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-
-def _rgb_to_hex(r: int, g: int, b: int) -> str:
-    r = max(0, min(255, int(r)))
-    g = max(0, min(255, int(g)))
-    b = max(0, min(255, int(b)))
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def _srgb_to_linear(c: float) -> float:
-    c = c / 255.0
-    if c <= 0.04045:
-        return c / 12.92
-    return ((c + 0.055) / 1.055) ** 2.4
-
-
-def _relative_luminance(hexv: str) -> float:
-    r, g, b = _hex_to_rgb(hexv)
-    rl = _srgb_to_linear(r)
-    gl = _srgb_to_linear(g)
-    bl = _srgb_to_linear(b)
-    return 0.2126 * rl + 0.7152 * gl + 0.0722 * bl
-
-
-def _contrast_ratio(fg_hex: str, bg_hex: str) -> float:
-    l1 = _relative_luminance(fg_hex)
-    l2 = _relative_luminance(bg_hex)
-    lighter = max(l1, l2)
-    darker = min(l1, l2)
-    return (lighter + 0.05) / (darker + 0.05)
-
-
-def _shift_toward(hexv: str, toward: str, amount: float) -> str:
-    amount = max(0.0, min(1.0, float(amount)))
-    r, g, b = _hex_to_rgb(hexv)
-    tr, tg, tb = _hex_to_rgb(toward)
-    nr = int(round(r + (tr - r) * amount))
-    ng = int(round(g + (tg - g) * amount))
-    nb = int(round(b + (tb - b) * amount))
-    return _rgb_to_hex(nr, ng, nb)
-
-
-def _lift_or_drop(hexv: str, amount: float) -> str:
-    # Lighten dark colors, darken light colors.
-    try:
-        lum = _relative_luminance(hexv)
-    except Exception:
-        return hexv
-    if lum < 0.5:
-        return _shift_toward(hexv, "#ffffff", amount)
-    return _shift_toward(hexv, "#000000", amount)
-
-
-def _best_bw_for_bg(bg_hex: str) -> str:
-    # Choose between black/white for readability.
-    try:
-        c_black = _contrast_ratio("#000000", bg_hex)
-        c_white = _contrast_ratio("#ffffff", bg_hex)
-        return "#000000" if c_black >= c_white else "#ffffff"
-    except Exception:
-        return "#000000"
-
-
-class App:
+class App(ThemeSupport):
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Signal Export Browser v3")
@@ -476,53 +155,6 @@ class App:
         self._make_ui()
         self._apply_theme_now()
 
-    def _resolve_font_spec(self, spec: str, fallback: str) -> str:
-        """Resolve a theme font spec into an installed font family.
-
-        Supports a simple fallback list separated by '|', e.g.
-        'Roboto|Segoe UI|Arial'. Returns the first installed family.
-        """
-        spec = (spec or "").strip()
-        if not spec:
-            return fallback
-        if "|" not in spec:
-            return spec
-        try:
-            installed = set(tkfont.families(self.root))
-        except Exception:
-            installed = set()
-        for cand in [p.strip() for p in spec.split("|") if p.strip()]:
-            if not installed or cand in installed:
-                return cand
-        return fallback
-
-    def _default_theme(self) -> Dict[str, Any]:
-        return {
-            "font_family": "Segoe UI",
-            # Back-compat: font_size is treated as UI size.
-            "font_size": 10,
-            "ui_size": 10,
-            "text_size": 10,
-            "heading_size": 11,
-            "mono_family": "Consolas",
-            "mono_size": 10,
-            "app_bg": "#f3f3f3",
-            "panel_bg": "#ffffff",
-            "widget_bg": "#ffffff",
-            "widget_fg": "#000000",
-            "select_bg": "#0b5cad",
-            "select_fg": "#ffffff",
-            "accent": "#0b5cad",
-            "text_bg": "#ffffff",
-            "text_fg": "#000000",
-            "meta_fg": "#666666",
-            "you_fg": "#0b5cad",
-            "them_fg": "#1a7f37",
-            "hit_bg": "#fff2a8",
-            "term_bg": "#d8f3ff",
-            "link_fg": "#8a2be2",
-        }
-
     def _thumb_cache_dir(self) -> Path:
         d = Path.cwd() / ".thumbcache"
         try:
@@ -536,9 +168,9 @@ class App:
     def _photo_cache_key(self, ap: str, kind: str, max_size: Tuple[int, int]) -> str:
         try:
             st = os.stat(ap)
-            return f"{ap}|{st.st_mtime_ns}|{st.st_size}|{kind}|{max_size[0]}x{max_size[1]}"
+            return f"{ap}|{st.st_mtime_ns}|{st.st_size}|{kind}|{max_size[0]}x{max_size[1]}|v={_THUMB_CACHE_VERSION}"
         except Exception:
-            return f"{ap}|{kind}|{max_size[0]}x{max_size[1]}"
+            return f"{ap}|{kind}|{max_size[0]}x{max_size[1]}|v={_THUMB_CACHE_VERSION}"
 
     def _clear_photo_cache(self) -> None:
         """Flush the in-memory PhotoImage cache."""
@@ -674,6 +306,128 @@ class App:
         except Exception:
             return False
 
+    def _try_ffmpeg_render_waveform(self, ap: str, out_path: Path, size: Tuple[int, int]) -> bool:
+        """Render a simple waveform thumbnail for audio files using ffmpeg.
+
+        This is a fallback when an audio file has no embedded cover art.
+        Requires ffmpeg to be installed.
+        """
+        ff = shutil.which("ffmpeg")
+        if not ff:
+            return False
+
+        w = max(64, int(size[0]))
+        h = max(48, int(size[1]))
+
+        bg_hex = self.theme.get("widget_bg", "#222222")
+        accent_hex = self.theme.get("accent", "#00a8fc")
+        # Use 0xRRGGBB to avoid any parsing issues with '#'.
+        bg_ff = "0x" + (str(bg_hex).strip().lstrip("#") if bg_hex else "222222")
+        accent_ff = "0x" + (str(accent_hex).strip().lstrip("#") if accent_hex else "00a8fc")
+
+        # Prefer ffmpeg's showwavespic, which summarizes the FULL audio stream into
+        # the target width.
+        filter_complex = (
+            f"color=c={bg_ff}:s={w}x{h}[bg];"
+            f"[0:a]showwavespic=s={w}x{h}:colors={accent_ff}[fg];"
+            f"[bg][fg]overlay=format=auto"
+        )
+        cmd = [
+            ff,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            ap,
+            "-filter_complex",
+            filter_complex,
+            "-frames:v",
+            "1",
+            "-y",
+            str(out_path),
+        ]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+                return True
+
+            import array as _array
+
+            # Fallback: decode the FULL audio stream at a very low sample rate so
+            # memory stays bounded, then render a waveform in Python.
+            cmd2 = [
+                ff,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                ap,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "800",
+                "-f",
+                "s16le",
+                "pipe:1",
+            ]
+            r2 = subprocess.run(cmd2, capture_output=True)
+            if r2.returncode != 0 or not r2.stdout:
+                return False
+
+            raw = r2.stdout
+            raw = raw[: (len(raw) // 2) * 2]  # int16 alignment
+            if not raw:
+                return False
+            samples = _array.array("h")
+            samples.frombytes(raw)
+            if not samples:
+                return False
+
+            max_abs = max((abs(int(v)) for v in samples), default=0)
+            if max_abs <= 0:
+                return False
+
+            try:
+                bg = _hex_to_rgb(bg_hex)
+            except Exception:
+                bg = (34, 34, 34)
+            try:
+                accent = _hex_to_rgb(accent_hex)
+            except Exception:
+                accent = (0, 168, 252)
+
+            im = Image.new("RGB", (w, h), bg)
+            draw = ImageDraw.Draw(im)
+            mid = h // 2
+            pad = max(6, h // 10)
+            scale = max(1, mid - pad)
+
+            step = max(1, len(samples) // w)
+            for x in range(w):
+                i0 = x * step
+                i1 = min(len(samples), i0 + step)
+                if i0 >= i1:
+                    break
+                seg = samples[i0:i1]
+                amp = 0
+                for v in seg:
+                    av = abs(int(v))
+                    if av > amp:
+                        amp = av
+                y = int((amp / max_abs) * scale)
+                if y <= 0:
+                    continue
+                draw.line((x, mid - y, x, mid + y), fill=accent)
+
+            try:
+                im.save(str(out_path), "JPEG", quality=85)
+            except Exception:
+                return False
+            return out_path.exists() and out_path.stat().st_size > 0
+        except Exception:
+            return False
+
     def _attachment_thumbnail_photo(self, ap: str, kind: str, file_name: str, max_size: Tuple[int, int],
                                      duration_ms: Optional[int] = None) -> Optional[ImageTk.PhotoImage]:
         """Return a PhotoImage thumbnail for media attachments.
@@ -703,9 +457,9 @@ class App:
         cache_dir = self._thumb_cache_dir()
         try:
             st = os.stat(ap)
-            key_src = f"{ap}|{st.st_mtime_ns}|{st.st_size}|{kind}|{max_size[0]}x{max_size[1]}".encode("utf-8", errors="ignore")
+            key_src = f"{ap}|{st.st_mtime_ns}|{st.st_size}|{kind}|{max_size[0]}x{max_size[1]}|v={_THUMB_CACHE_VERSION}".encode("utf-8", errors="ignore")
         except Exception:
-            key_src = f"{ap}|{kind}|{max_size[0]}x{max_size[1]}".encode("utf-8", errors="ignore")
+            key_src = f"{ap}|{kind}|{max_size[0]}x{max_size[1]}|v={_THUMB_CACHE_VERSION}".encode("utf-8", errors="ignore")
         key = hashlib.sha1(key_src).hexdigest()
 
         # Persistent disk cache for ALL types (image/video/audio)
@@ -732,6 +486,8 @@ class App:
                     ok = self._try_ffmpeg_extract_frame(ap, cache_img)
                 elif kind == "audio":
                     ok = self._try_ffmpeg_extract_cover(ap, cache_img)
+                    if not ok:
+                        ok = self._try_ffmpeg_render_waveform(ap, cache_img, max_size)
                 if not ok:
                     im = self._placeholder_thumbnail(kind, file_name, max_size)
                     im.thumbnail(max_size)
@@ -807,309 +563,6 @@ class App:
             draw.rectangle([x, y, x + tw + pad_x * 2, y + th + pad_y * 2], fill="#000000")
         draw.text((x + pad_x, y + pad_y), label, fill="#ffffff")
         return im
-
-    def _normalize_theme(self, raw: Dict[str, Any]) -> Dict[str, Any]:
-        base = dict(self._default_theme())
-        if isinstance(raw, dict):
-            base.update(raw)
-
-        def _as_int(v: Any, default: int) -> int:
-            if isinstance(v, int):
-                return v
-            if isinstance(v, str):
-                try:
-                    return int(v.strip())
-                except Exception:
-                    return default
-            return default
-
-        def _as_str(v: Any, default: str) -> str:
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-            return default
-
-        # Fonts (support fallback specs separated by '|')
-        base["font_family"] = self._resolve_font_spec(
-            _as_str(base.get("font_family"), "Segoe UI"),
-            "Segoe UI",
-        )
-        base["mono_family"] = self._resolve_font_spec(
-            _as_str(base.get("mono_family"), "Consolas"),
-            "Consolas",
-        )
-
-        # Sizes (keep font_size as UI size for older saved themes)
-        ui_size = _as_int(base.get("ui_size"), _as_int(base.get("font_size"), 10))
-        base["font_size"] = ui_size
-        base["ui_size"] = ui_size
-        base["text_size"] = _as_int(base.get("text_size"), ui_size)
-        base["heading_size"] = _as_int(base.get("heading_size"), max(7, ui_size + 1))
-        base["mono_size"] = _as_int(base.get("mono_size"), ui_size)
-
-        # Colors: validate/normalize
-        for k in (
-            "app_bg",
-            "panel_bg",
-            "widget_bg",
-            "widget_fg",
-            "select_bg",
-            "select_fg",
-            "accent",
-            "text_bg",
-            "text_fg",
-            "meta_fg",
-            "you_fg",
-            "them_fg",
-            "hit_bg",
-            "term_bg",
-            "link_fg",
-        ):
-            v = base.get(k)
-            if not _is_hex_color(v):
-                base[k] = self._default_theme().get(k)
-            else:
-                base[k] = str(v).lower()
-
-        # Derived depth: only if explicit values are missing/empty in raw
-        def _missing(key: str) -> bool:
-            if not isinstance(raw, dict):
-                return False
-            v = raw.get(key)
-            return v is None or (isinstance(v, str) and not v.strip())
-
-        if _missing("panel_bg"):
-            base["panel_bg"] = _lift_or_drop(base["app_bg"], 0.06)
-        if _missing("widget_bg"):
-            base["widget_bg"] = _lift_or_drop(base["panel_bg"], 0.05)
-        if _missing("text_bg"):
-            base["text_bg"] = base["panel_bg"]
-
-        if _missing("widget_fg"):
-            base["widget_fg"] = _best_bw_for_bg(base["widget_bg"])
-        if _missing("text_fg"):
-            base["text_fg"] = _best_bw_for_bg(base["text_bg"])
-
-        # Ensure select_fg has reasonable contrast against select_bg if not specified
-        if _missing("select_fg"):
-            base["select_fg"] = _best_bw_for_bg(base["select_bg"])
-
-        return base
-
-    def _theme_presets(self) -> Dict[str, Dict[str, Any]]:
-        base = self._default_theme()
-        return {
-            # Stock presets: popular app-inspired palettes.
-            # Keep an equal number of light and dark themes.
-            "GitHub Light": {
-                **base,
-                "font_family": "-apple-system|Segoe UI|Inter|Arial",
-                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
-                "app_bg": "#f6f8fa",
-                "panel_bg": "#ffffff",
-                "widget_bg": "#ffffff",
-                "widget_fg": "#24292f",
-                "select_bg": "#0969da",
-                "select_fg": "#ffffff",
-                "accent": "#0969da",
-                "text_bg": "#ffffff",
-                "text_fg": "#24292f",
-                "meta_fg": "#57606a",
-                "you_fg": "#0969da",
-                "them_fg": "#1a7f37",
-                "hit_bg": "#fff8c5",
-                "term_bg": "#ddf4ff",
-                "link_fg": "#0969da",
-            },
-            "Google Light": {
-                **base,
-                "font_family": "Roboto|Segoe UI|Arial",
-                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
-                "app_bg": "#f1f3f4",
-                "panel_bg": "#ffffff",
-                "widget_bg": "#ffffff",
-                "widget_fg": "#202124",
-                "select_bg": "#1a73e8",
-                "select_fg": "#ffffff",
-                "accent": "#1a73e8",
-                "text_bg": "#ffffff",
-                "text_fg": "#202124",
-                "meta_fg": "#5f6368",
-                "you_fg": "#1a73e8",
-                "them_fg": "#34a853",
-                "hit_bg": "#fff8e1",
-                "term_bg": "#e8f0fe",
-                "link_fg": "#1a73e8",
-            },
-            "Slack Light": {
-                **base,
-                "font_family": "Lato|Segoe UI|Arial",
-                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
-                "app_bg": "#f8f8f8",
-                "panel_bg": "#ffffff",
-                "widget_bg": "#ffffff",
-                "widget_fg": "#1d1c1d",
-                "select_bg": "#4a154b",
-                "select_fg": "#ffffff",
-                "accent": "#4a154b",
-                "text_bg": "#ffffff",
-                "text_fg": "#1d1c1d",
-                "meta_fg": "#616061",
-                "you_fg": "#4a154b",
-                "them_fg": "#2eb67d",
-                "hit_bg": "#fff3c4",
-                "term_bg": "#e6f7ff",
-                "link_fg": "#36c5f0",
-            },
-            "Apple Notes Light": {
-                **base,
-                "font_family": "SF Pro Text|Segoe UI|Arial",
-                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
-                "app_bg": "#f5f2ea",
-                "panel_bg": "#fffdf8",
-                "widget_bg": "#fffdf8",
-                "widget_fg": "#1f2328",
-                "select_bg": "#ffd60a",
-                "select_fg": "#1f2328",
-                "accent": "#ff9f0a",
-                "text_bg": "#fffdf8",
-                "text_fg": "#1f2328",
-                "meta_fg": "#6e6e73",
-                "you_fg": "#0a84ff",
-                "them_fg": "#34c759",
-                "hit_bg": "#ffefb0",
-                "term_bg": "#e9f5ff",
-                "link_fg": "#0a84ff",
-            },
-            "GitHub Dark": {
-                **base,
-                "font_family": "-apple-system|Segoe UI|Inter|Arial",
-                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
-                "app_bg": "#0d1117",
-                "panel_bg": "#161b22",
-                "widget_bg": "#21262d",
-                "widget_fg": "#c9d1d9",
-                "select_bg": "#1f6feb",
-                "select_fg": "#ffffff",
-                "accent": "#1f6feb",
-                "text_bg": "#0d1117",
-                "text_fg": "#c9d1d9",
-                "meta_fg": "#8b949e",
-                "you_fg": "#58a6ff",
-                "them_fg": "#3fb950",
-                "hit_bg": "#5a3b00",
-                "term_bg": "#003049",
-                "link_fg": "#a371f7",
-            },
-            "Discord Dark": {
-                **base,
-                "font_family": "gg sans|Whitney|Segoe UI|Arial",
-                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
-                "app_bg": "#1e1f22",
-                "panel_bg": "#2b2d31",
-                "widget_bg": "#313338",
-                "widget_fg": "#dbdee1",
-                "select_bg": "#5865f2",
-                "select_fg": "#ffffff",
-                "accent": "#5865f2",
-                "text_bg": "#2b2d31",
-                "text_fg": "#dbdee1",
-                "meta_fg": "#949ba4",
-                "you_fg": "#5865f2",
-                "them_fg": "#3ba55d",
-                "hit_bg": "#4f3b00",
-                "term_bg": "#22303c",
-                "link_fg": "#00a8fc",
-            },
-            "Spotify Dark": {
-                **base,
-                "font_family": "Circular Spotify|Circular|Segoe UI|Arial",
-                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
-                "app_bg": "#121212",
-                "panel_bg": "#181818",
-                "widget_bg": "#242424",
-                "widget_fg": "#ffffff",
-                "select_bg": "#1db954",
-                "select_fg": "#000000",
-                "accent": "#1db954",
-                "text_bg": "#121212",
-                "text_fg": "#ffffff",
-                "meta_fg": "#b3b3b3",
-                "you_fg": "#1db954",
-                "them_fg": "#1ed760",
-                "hit_bg": "#3a2a00",
-                "term_bg": "#003322",
-                "link_fg": "#1db954",
-            },
-            "X Dark": {
-                **base,
-                "font_family": "TwitterChirp|Segoe UI|Arial",
-                "mono_family": "Cascadia Mono|Consolas|Menlo|Courier New",
-                "app_bg": "#000000",
-                "panel_bg": "#0a0a0a",
-                "widget_bg": "#16181c",
-                "widget_fg": "#e7e9ea",
-                "select_bg": "#1d9bf0",
-                "select_fg": "#ffffff",
-                "accent": "#1d9bf0",
-                "text_bg": "#000000",
-                "text_fg": "#e7e9ea",
-                "meta_fg": "#71767b",
-                "you_fg": "#1d9bf0",
-                "them_fg": "#00ba7c",
-                "hit_bg": "#2f2a00",
-                "term_bg": "#001d2a",
-                "link_fg": "#1d9bf0",
-            },
-        }
-
-    def _load_custom_themes(self) -> None:
-        try:
-            import json
-
-            if not self._themes_path.exists():
-                self.custom_themes = {}
-                return
-            data = json.loads(self._themes_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                themes = data.get("themes")
-                if isinstance(themes, dict):
-                    cleaned: Dict[str, Dict[str, Any]] = {}
-                    for name, theme in themes.items():
-                        if not isinstance(name, str) or not isinstance(theme, dict):
-                            continue
-                        t: Dict[str, Any] = {}
-                        for k, v in theme.items():
-                            if isinstance(k, str) and isinstance(v, (str, int)):
-                                t[k] = v
-                        if t:
-                            cleaned[name] = t
-                    self.custom_themes = cleaned
-        except Exception:
-            self.custom_themes = {}
-
-    def _save_custom_themes(self) -> None:
-        try:
-            import json
-
-            payload = {"themes": self.custom_themes}
-            self._themes_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except Exception as e:
-            messagebox.showerror("Save themes failed", str(e))
-
-    def _is_stock_theme(self, name: str) -> bool:
-        return name in self._theme_presets()
-
-    def _set_active_theme_by_name(self, name: str) -> None:
-        presets = self._theme_presets()
-        if name in presets:
-            self.active_theme_name = name
-            self.theme = self._normalize_theme(presets[name])
-            self._apply_theme_now()
-            return
-        if name in self.custom_themes:
-            self.active_theme_name = name
-            self.theme = self._normalize_theme(self.custom_themes[name])
-            self._apply_theme_now()
 
     def _load_app_state(self) -> None:
         try:
@@ -1256,95 +709,6 @@ class App:
         except Exception:
             pass
 
-    def _apply_theme_to_ttk(self) -> None:
-        try:
-            if "clam" in self._style.theme_names():
-                self._style.theme_use("clam")
-        except Exception:
-            pass
-
-        # Fonts (use named Tk fonts so existing widgets update live)
-        ui_font = "TkDefaultFont"
-        heading_font = "TkHeadingFont"
-
-        app_bg = self.theme.get("app_bg", "#f3f3f3")
-        panel_bg = self.theme.get("panel_bg", "#ffffff")
-        widget_bg = self.theme.get("widget_bg", panel_bg)
-        fg = self.theme.get("widget_fg", "#000000")
-        select_bg = self.theme.get("select_bg", self.theme.get("accent", "#0b5cad"))
-        select_fg = self.theme.get("select_fg", "#ffffff")
-
-        # Base
-        self.root.configure(background=app_bg)
-        self._style.configure(".", background=app_bg, foreground=fg, font=ui_font)
-        self._style.configure("TFrame", background=app_bg)
-        self._style.configure("TLabelframe", background=app_bg)
-        self._style.configure("TLabelframe.Label", background=app_bg, foreground=fg)
-        self._style.configure("TLabel", background=app_bg, foreground=fg, font=ui_font)
-
-        # Buttons
-        self._style.configure("TButton", background=panel_bg, foreground=fg, font=ui_font)
-        self._style.map(
-            "TButton",
-            background=[("active", widget_bg), ("pressed", widget_bg)],
-            foreground=[("disabled", "#888888")],
-        )
-
-        # Entries/Combobox
-        self._style.configure("TEntry", fieldbackground=widget_bg, foreground=fg, font=ui_font)
-        self._style.map(
-            "TEntry",
-            fieldbackground=[("disabled", panel_bg), ("readonly", widget_bg)],
-            foreground=[("disabled", "#888888")],
-        )
-        self._style.configure("TCombobox", fieldbackground=widget_bg, background=widget_bg, foreground=fg, font=ui_font)
-        self._style.map(
-            "TCombobox",
-            fieldbackground=[("readonly", widget_bg)],
-            background=[("readonly", widget_bg)],
-            foreground=[("disabled", "#888888")],
-        )
-
-        # Notebook
-        self._style.configure("TNotebook", background=app_bg)
-        self._style.configure("TNotebook.Tab", background=panel_bg, foreground=fg, font=ui_font)
-        self._style.map(
-            "TNotebook.Tab",
-            background=[("selected", widget_bg)],
-            foreground=[("selected", fg)],
-        )
-
-        # Treeview
-        self._style.configure(
-            "Treeview",
-            background=widget_bg,
-            fieldbackground=widget_bg,
-            foreground=fg,
-            font=ui_font,
-        )
-        self._style.configure("Treeview.Heading", background=panel_bg, foreground=fg, font=heading_font)
-        self._style.map(
-            "Treeview",
-            background=[("selected", select_bg)],
-            foreground=[("selected", select_fg)],
-        )
-
-        # Scrollbar
-        self._style.configure("TScrollbar", background=panel_bg, troughcolor=app_bg)
-
-    def _apply_theme_to_menu(self) -> None:
-        if not self._menubar or not self._settings_menu:
-            return
-        bg = self.theme.get("panel_bg", "#ffffff")
-        fg = self.theme.get("widget_fg", "#000000")
-        abg = self.theme.get("select_bg", self.theme.get("accent", "#0b5cad"))
-        afg = self.theme.get("select_fg", "#ffffff")
-        try:
-            self._menubar.configure(background=bg, foreground=fg, activebackground=abg, activeforeground=afg, font="TkMenuFont")
-            self._settings_menu.configure(background=bg, foreground=fg, activebackground=abg, activeforeground=afg, font="TkMenuFont")
-        except Exception:
-            pass
-
     def _speaker_names_for_message_ids(self, message_ids: List[int]) -> Dict[int, str]:
         if self._conn is None or not message_ids:
             return {}
@@ -1363,434 +727,40 @@ class App:
                 out[mid] = nm or "Them"
         return out
 
-    def _apply_theme_to_text(self, txt: tk.Text) -> None:
-        bg = self.theme.get("text_bg", "#ffffff")
-        fg = self.theme.get("text_fg", "#000000")
-        try:
-            txt.configure(background=bg, foreground=fg, insertbackground=fg, font="TkTextFont")
-        except Exception:
-            pass
-        txt.tag_configure("meta", foreground=self.theme.get("meta_fg", "#666666"))
-        txt.tag_configure("you", foreground=self.theme.get("you_fg", "#0b5cad"))
-        txt.tag_configure("them", foreground=self.theme.get("them_fg", "#1a7f37"))
-        txt.tag_configure("hit", background=self.theme.get("hit_bg", "#fff2a8"))
-        txt.tag_configure("term", background=self.theme.get("term_bg", "#d8f3ff"))
-
-    def _apply_theme_fonts(self) -> None:
-        def _as_int(v: Any, default: int) -> int:
-            if isinstance(v, int):
-                return v
-            if isinstance(v, str):
-                try:
-                    return int(v.strip())
-                except Exception:
-                    return default
-            return default
-
-        def _as_str(v: Any, default: str) -> str:
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-            return default
-
-        ui_family = _as_str(self.theme.get("font_family"), "Segoe UI")
-        ui_size = _as_int(self.theme.get("ui_size"), _as_int(self.theme.get("font_size"), 10))
-        text_size = _as_int(self.theme.get("text_size"), ui_size)
-        heading_size = _as_int(self.theme.get("heading_size"), max(7, ui_size + 1))
-        mono_family = _as_str(self.theme.get("mono_family"), "Consolas")
-        mono_size = _as_int(self.theme.get("mono_size"), ui_size)
-
-        try:
-            tkfont.nametofont("TkDefaultFont").configure(family=ui_family, size=ui_size)
-        except Exception:
-            pass
-        try:
-            tkfont.nametofont("TkTextFont").configure(family=ui_family, size=text_size)
-        except Exception:
-            pass
-        try:
-            tkfont.nametofont("TkMenuFont").configure(family=ui_family, size=ui_size)
-        except Exception:
-            pass
-        try:
-            tkfont.nametofont("TkHeadingFont").configure(family=ui_family, size=heading_size, weight="bold")
-        except Exception:
-            pass
-        try:
-            tkfont.nametofont("TkFixedFont").configure(family=mono_family, size=mono_size)
-        except Exception:
-            pass
-
-    def _apply_theme_now(self) -> None:
-        # Ensure theme is always safe/complete before applying.
-        self.theme = self._normalize_theme(self.theme)
-        # Fonts first so ttk + Text widgets pick them up.
-        self._apply_theme_fonts()
-        # Apply ttk/global colors first (most of the UI)
-        self._apply_theme_to_ttk()
-        self._apply_theme_to_menu()
-
-        link_fg = self.theme.get("link_fg", "#8a2be2")
-
-        try:
-            self._apply_theme_to_text(self.preview_txt)
-            self.preview_txt.tag_configure("pv_link", foreground=link_fg, underline=True)
-        except Exception:
-            pass
-
-        try:
-            self._apply_theme_to_text(self.build_log)
-            self.build_log.configure(font="TkFixedFont")
-        except Exception:
-            pass
-
-        try:
-            panel_bg = self.theme.get("panel_bg", "#ffffff")
-            if hasattr(self, "gallery_canvas"):
-                self.gallery_canvas.configure(background=panel_bg, highlightthickness=0)
-        except Exception:
-            pass
-
-        # Propagate to already-open thread windows
-        alive: List[tk.Text] = []
-        for txt in list(self._open_thread_text_widgets):
-            try:
-                if not txt.winfo_exists():
-                    continue
-                self._apply_theme_to_text(txt)
-                txt.tag_configure("link", foreground=link_fg, underline=True)
-                alive.append(txt)
-            except Exception:
-                continue
-        self._open_thread_text_widgets = alive
-
-        # Refresh gallery timestamps if a chat is loaded
-        try:
-            if hasattr(self, "_gallery_selected_chat_id"):
-                chat_id = self._safe_int(self._gallery_selected_chat_id.get())
-                if chat_id:
-                    self._refresh_gallery_for_chat(chat_id)
-        except Exception:
-            pass
-
     def _build_menubar(self) -> None:
         menubar = tk.Menu(self.root)
+
+        filem = tk.Menu(menubar, tearoff=0)
+        filem.add_command(label="Open DB...", command=lambda: (self._pick_db_in(), self._on_connect()))
+        filem.add_separator()
+        filem.add_command(label="Exit", command=self.root.destroy)
+
         settings = tk.Menu(menubar, tearoff=0)
         settings.add_command(label="Theme...", command=self._open_theme_dialog)
         settings.add_command(label="Reset theme", command=self._reset_theme)
+
+        helpm = tk.Menu(menubar, tearoff=0)
+
+        def about() -> None:
+            messagebox.showinfo(
+                "About",
+                "Signal Export Browser\n\n"
+                "- Browse/search Signal exports\n"
+                "- Media gallery + exports\n"
+                "- Stats + word frequency\n\n"
+                "Tip: Use Settings → Theme to customize colors/fonts.",
+                parent=self.root,
+            )
+
+        helpm.add_command(label="About", command=about)
+
+        menubar.add_cascade(label="File", menu=filem)
         menubar.add_cascade(label="Settings", menu=settings)
+        menubar.add_cascade(label="Help", menu=helpm)
         self.root.config(menu=menubar)
         self._menubar = menubar
         self._settings_menu = settings
         self._apply_theme_to_menu()
-
-    def _reset_theme(self) -> None:
-        self.theme = self._normalize_theme(self._default_theme())
-        self.active_theme_name = ""
-        self._apply_theme_now()
-
-    def _open_theme_dialog(self) -> None:
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Theme")
-        dlg.geometry("640x640")
-        dlg.transient(self.root)
-
-        theme_work = dict(self._normalize_theme(self.theme))
-
-        presets = self._theme_presets()
-        stock_names = list(presets.keys())
-        custom_names = sorted(self.custom_themes.keys(), key=lambda s: s.lower())
-
-        theme_combo_values = ["(Current)"] + [f"Stock: {n}" for n in stock_names] + [f"Custom: {n}" for n in custom_names]
-
-        contrast_var = tk.StringVar(value="")
-
-        def update_contrast() -> None:
-            try:
-                t = self._normalize_theme(theme_work)
-                w = _contrast_ratio(t["widget_fg"], t["widget_bg"])
-                tx = _contrast_ratio(t["text_fg"], t["text_bg"])
-                sel = _contrast_ratio(t["select_fg"], t["select_bg"])
-                def mark(x: float) -> str:
-                    return "OK" if x >= 4.5 else "LOW"
-                contrast_var.set(
-                    f"Contrast (higher is better):  Widget {w:.2f} ({mark(w)})   Text {tx:.2f} ({mark(tx)})   Selection {sel:.2f} ({mark(sel)})"
-                )
-            except Exception:
-                contrast_var.set("Contrast: n/a")
-
-        def apply_work() -> None:
-            norm = self._normalize_theme(theme_work)
-            theme_work.clear()
-            theme_work.update(norm)
-            self.theme = dict(norm)
-            self._apply_theme_now()
-            # Refresh UI elements driven by theme_work
-            for k, sw in swatches.items():
-                try:
-                    sw.configure(background=theme_work.get(k, "#ffffff"))
-                except Exception:
-                    pass
-            ui_family_var.set(str(theme_work.get("font_family", "Segoe UI")))
-            ui_size_var.set(str(theme_work.get("ui_size", theme_work.get("font_size", 10))))
-            text_size_var.set(str(theme_work.get("text_size", theme_work.get("ui_size", theme_work.get("font_size", 10)))))
-            heading_size_var.set(str(theme_work.get("heading_size", max(7, int(theme_work.get("ui_size", theme_work.get("font_size", 10))) + 1))))
-            mono_family_var.set(str(theme_work.get("mono_family", "Consolas")))
-            mono_size_var.set(str(theme_work.get("mono_size", theme_work.get("ui_size", theme_work.get("font_size", 10)))))
-            update_contrast()
-
-        def apply_named(name: str) -> None:
-            if name.startswith("Stock: "):
-                nm = name[len("Stock: "):]
-                if nm not in presets:
-                    return
-                theme_work.clear()
-                theme_work.update(self._normalize_theme(presets[nm]))
-                self.active_theme_name = nm
-            elif name.startswith("Custom: "):
-                nm = name[len("Custom: "):]
-                if nm not in self.custom_themes:
-                    return
-                theme_work.clear()
-                theme_work.update(self._normalize_theme(self.custom_themes[nm]))
-                self.active_theme_name = nm
-            else:
-                return
-            for k, sw in swatches.items():
-                sw.configure(background=theme_work.get(k, "#ffffff"))
-            ui_family_var.set(str(theme_work.get("font_family", "Segoe UI")))
-            ui_size_var.set(str(theme_work.get("ui_size", theme_work.get("font_size", 10))))
-            text_size_var.set(str(theme_work.get("text_size", theme_work.get("ui_size", theme_work.get("font_size", 10)))))
-            heading_size_var.set(str(theme_work.get("heading_size", max(7, int(theme_work.get("ui_size", theme_work.get("font_size", 10))) + 1))))
-            mono_family_var.set(str(theme_work.get("mono_family", "Consolas")))
-            mono_size_var.set(str(theme_work.get("mono_size", theme_work.get("ui_size", theme_work.get("font_size", 10)))))
-            apply_work()
-
-        def pick(key: str) -> None:
-            initial = theme_work.get(key, "")
-            _rgb, hexv = colorchooser.askcolor(color=initial or None, parent=dlg)
-            if not hexv:
-                return
-            theme_work[key] = hexv
-            swatches[key].configure(background=hexv)
-            apply_work()
-
-        frm = ttk.Frame(dlg, padding=12)
-        frm.pack(fill=tk.BOTH, expand=True)
-
-        preset_row = ttk.Frame(frm)
-        preset_row.grid(row=0, column=0, columnspan=3, sticky="we", pady=(0, 10))
-        ttk.Label(preset_row, text="Theme").pack(side=tk.LEFT)
-        preset_combo = ttk.Combobox(preset_row, values=theme_combo_values, state="readonly", width=34)
-        preset_combo.pack(side=tk.LEFT, padx=8)
-        preset_combo.set("(Current)")
-        preset_combo.bind("<<ComboboxSelected>>", lambda _e: apply_named(preset_combo.get()))
-
-        save_row = ttk.Frame(frm)
-        save_row.grid(row=1, column=0, columnspan=3, sticky="we", pady=(0, 10))
-        ttk.Label(save_row, text="Save as").pack(side=tk.LEFT)
-        name_var = tk.StringVar(value="")
-        ttk.Entry(save_row, textvariable=name_var, width=26).pack(side=tk.LEFT, padx=8)
-
-        io_row = ttk.Frame(frm)
-        io_row.grid(row=2, column=0, columnspan=3, sticky="we", pady=(0, 10))
-
-        def export_theme() -> None:
-            try:
-                import json
-
-                p = filedialog.asksaveasfilename(
-                    parent=dlg,
-                    defaultextension=".json",
-                    filetypes=[("JSON", "*.json")],
-                    title="Export theme as JSON",
-                )
-                if not p:
-                    return
-                norm = self._normalize_theme(theme_work)
-                Path(p).write_text(json.dumps(norm, indent=2), encoding="utf-8")
-            except Exception as e:
-                messagebox.showerror("Export failed", str(e), parent=dlg)
-
-        def import_theme() -> None:
-            try:
-                import json
-
-                p = filedialog.askopenfilename(
-                    parent=dlg,
-                    filetypes=[("JSON", "*.json"), ("All files", "*")],
-                    title="Import theme JSON",
-                )
-                if not p:
-                    return
-                data = json.loads(Path(p).read_text(encoding="utf-8"))
-                if isinstance(data, dict) and isinstance(data.get("theme"), dict):
-                    data = data.get("theme")
-                if not isinstance(data, dict):
-                    raise ValueError("Theme JSON must be an object/dict")
-                theme_work.clear()
-                theme_work.update(self._normalize_theme(data))
-                for k, sw in swatches.items():
-                    sw.configure(background=theme_work.get(k, "#ffffff"))
-                ui_family_var.set(str(theme_work.get("font_family", "Segoe UI")))
-                ui_size_var.set(str(theme_work.get("ui_size", theme_work.get("font_size", 10))))
-                text_size_var.set(str(theme_work.get("text_size", theme_work.get("ui_size", theme_work.get("font_size", 10)))))
-                heading_size_var.set(str(theme_work.get("heading_size", max(7, int(theme_work.get("ui_size", theme_work.get("font_size", 10))) + 1))))
-                mono_family_var.set(str(theme_work.get("mono_family", "Consolas")))
-                mono_size_var.set(str(theme_work.get("mono_size", theme_work.get("ui_size", theme_work.get("font_size", 10)))))
-                apply_work()
-            except Exception as e:
-                messagebox.showerror("Import failed", str(e), parent=dlg)
-
-        ttk.Button(io_row, text="Import...", command=import_theme).pack(side=tk.LEFT)
-        ttk.Button(io_row, text="Export...", command=export_theme).pack(side=tk.LEFT, padx=8)
-
-        # Fonts
-        try:
-            families = sorted(set(tkfont.families()))
-        except Exception:
-            families = []
-
-        ui_family_var = tk.StringVar(value=str(theme_work.get("font_family", "Segoe UI")))
-        ui_size_var = tk.StringVar(value=str(theme_work.get("ui_size", theme_work.get("font_size", 10))))
-        text_size_var = tk.StringVar(value=str(theme_work.get("text_size", theme_work.get("ui_size", theme_work.get("font_size", 10)))))
-        heading_size_var = tk.StringVar(value=str(theme_work.get("heading_size", max(7, int(theme_work.get("ui_size", theme_work.get("font_size", 10))) + 1))))
-        mono_family_var = tk.StringVar(value=str(theme_work.get("mono_family", "Consolas")))
-        mono_size_var = tk.StringVar(value=str(theme_work.get("mono_size", theme_work.get("ui_size", theme_work.get("font_size", 10)))))
-
-        def _apply_font_vars() -> None:
-            theme_work["font_family"] = (ui_family_var.get() or "").strip() or "Segoe UI"
-            try:
-                ui_sz = int((ui_size_var.get() or "").strip())
-                theme_work["ui_size"] = ui_sz
-                theme_work["font_size"] = ui_sz
-            except Exception:
-                pass
-            try:
-                theme_work["text_size"] = int((text_size_var.get() or "").strip())
-            except Exception:
-                pass
-            try:
-                theme_work["heading_size"] = int((heading_size_var.get() or "").strip())
-            except Exception:
-                pass
-            theme_work["mono_family"] = (mono_family_var.get() or "").strip() or "Consolas"
-            try:
-                theme_work["mono_size"] = int((mono_size_var.get() or "").strip())
-            except Exception:
-                pass
-            apply_work()
-
-        Spin = getattr(ttk, "Spinbox", tk.Spinbox)
-
-        font_row = ttk.Frame(frm)
-        font_row.grid(row=3, column=0, columnspan=3, sticky="we", pady=(0, 6))
-
-        ttk.Label(font_row, text="Font").grid(row=0, column=0, sticky="w")
-        ui_family = ttk.Combobox(font_row, values=families, textvariable=ui_family_var, width=26)
-        ui_family.grid(row=0, column=1, sticky="w", padx=(8, 6))
-        ui_family.bind("<<ComboboxSelected>>", lambda _e: _apply_font_vars())
-        ui_family.bind("<FocusOut>", lambda _e: _apply_font_vars())
-
-        ttk.Label(font_row, text="UI").grid(row=0, column=2, sticky="e", padx=(8, 0))
-        ui_size = Spin(font_row, from_=7, to=32, textvariable=ui_size_var, width=5)
-        ui_size.grid(row=0, column=3, sticky="w", padx=(6, 0))
-        ui_size.bind("<Return>", lambda _e: _apply_font_vars())
-        ui_size.bind("<FocusOut>", lambda _e: _apply_font_vars())
-
-        ttk.Label(font_row, text="Text").grid(row=0, column=4, sticky="e", padx=(8, 0))
-        text_size = Spin(font_row, from_=7, to=32, textvariable=text_size_var, width=5)
-        text_size.grid(row=0, column=5, sticky="w", padx=(6, 0))
-        text_size.bind("<Return>", lambda _e: _apply_font_vars())
-        text_size.bind("<FocusOut>", lambda _e: _apply_font_vars())
-
-        ttk.Label(font_row, text="Mono").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        mono_family = ttk.Combobox(font_row, values=families, textvariable=mono_family_var, width=26)
-        mono_family.grid(row=1, column=1, sticky="w", padx=(8, 6), pady=(6, 0))
-        mono_family.bind("<<ComboboxSelected>>", lambda _e: _apply_font_vars())
-        mono_family.bind("<FocusOut>", lambda _e: _apply_font_vars())
-
-        ttk.Label(font_row, text="Mono").grid(row=1, column=2, sticky="e", padx=(8, 0), pady=(6, 0))
-        mono_size = Spin(font_row, from_=7, to=32, textvariable=mono_size_var, width=5)
-        mono_size.grid(row=1, column=3, sticky="w", padx=(6, 0), pady=(6, 0))
-        mono_size.bind("<Return>", lambda _e: _apply_font_vars())
-        mono_size.bind("<FocusOut>", lambda _e: _apply_font_vars())
-
-        ttk.Label(font_row, text="Head").grid(row=1, column=4, sticky="e", padx=(8, 0), pady=(6, 0))
-        heading_size = Spin(font_row, from_=7, to=40, textvariable=heading_size_var, width=5)
-        heading_size.grid(row=1, column=5, sticky="w", padx=(6, 0), pady=(6, 0))
-        heading_size.bind("<Return>", lambda _e: _apply_font_vars())
-        heading_size.bind("<FocusOut>", lambda _e: _apply_font_vars())
-
-        for c in range(6):
-            font_row.columnconfigure(c, weight=1 if c == 1 else 0)
-
-        contrast_row = ttk.Frame(frm)
-        contrast_row.grid(row=4, column=0, columnspan=3, sticky="we", pady=(0, 10))
-        ttk.Label(contrast_row, textvariable=contrast_var).pack(side=tk.LEFT)
-
-        rows = [
-            ("app_bg", "App background"),
-            ("panel_bg", "Panel background"),
-            ("widget_bg", "Widget background"),
-            ("widget_fg", "Widget text"),
-            ("select_bg", "Selection background"),
-            ("select_fg", "Selection text"),
-            ("accent", "Accent"),
-            ("text_bg", "Text background"),
-            ("text_fg", "Text color"),
-            ("meta_fg", "Meta text"),
-            ("you_fg", "You text"),
-            ("them_fg", "Them text"),
-            ("hit_bg", "Hit highlight"),
-            ("term_bg", "Term highlight"),
-            ("link_fg", "Link"),
-        ]
-
-        swatches: Dict[str, tk.Label] = {}
-        for i, (key, label) in enumerate(rows, start=5):
-            ttk.Label(frm, text=label).grid(row=i, column=0, sticky="w", pady=6)
-            sw = tk.Label(frm, width=12, relief="groove", background=theme_work.get(key, "#ffffff"))
-            sw.grid(row=i, column=1, sticky="w", padx=10)
-            swatches[key] = sw
-            ttk.Button(frm, text="Choose...", command=lambda k=key: pick(k)).grid(row=i, column=2, sticky="e")
-
-        frm.columnconfigure(0, weight=1)
-
-        btns = ttk.Frame(dlg, padding=(12, 0, 12, 12))
-        btns.pack(fill=tk.X)
-
-        def apply_only() -> None:
-            apply_work()
-
-        def save_named() -> None:
-            nm = (name_var.get() or "").strip()
-            if not nm:
-                messagebox.showwarning("Missing name", "Enter a theme name to save.")
-                return
-            if self._is_stock_theme(nm):
-                messagebox.showerror("Protected", "That name is a stock theme and cannot be overwritten. Choose a different name.")
-                return
-            norm = self._normalize_theme(theme_work)
-            theme_work.clear()
-            theme_work.update(norm)
-            self.custom_themes[nm] = dict(norm)
-            self._save_custom_themes()
-            self.active_theme_name = nm
-            messagebox.showinfo("Saved", f"Saved custom theme: {nm}")
-
-        def apply_and_save() -> None:
-            apply_work()
-            # Keep legacy behavior: if a name is provided, save into custom themes.
-            if (name_var.get() or "").strip():
-                save_named()
-            dlg.destroy()
-
-        ttk.Button(btns, text="Apply", command=apply_only).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Save as", command=save_named).pack(side=tk.LEFT, padx=8)
-        ttk.Button(btns, text="Save & Close", command=apply_and_save).pack(side=tk.LEFT, padx=8)
-        ttk.Button(btns, text="Close", command=dlg.destroy).pack(side=tk.RIGHT)
-
-        update_contrast()
 
     def _make_ui(self) -> None:
         self._build_menubar()
@@ -3009,7 +1979,12 @@ class App:
                                values=["all", "image", "video", "audio", "doc", "file"],
                                width=8, state="readonly")
         kind_cb.pack(side=tk.LEFT, padx=6)
-        kind_cb.bind("<<ComboboxSelected>>", lambda _e: self._gallery_load_current())
+        # Use a variable trace so the filter refresh works reliably across Tk
+        # versions/platforms (<<ComboboxSelected>> can be inconsistent).
+        self._gallery_kind_filter.trace_add(
+            "write",
+            lambda *_a: self._refresh_gallery_for_chat(self._safe_int(self._gallery_selected_chat_id.get())),
+        )
 
         ttk.Button(top, text="Rebuild Thumbnails", command=self._start_rebuild_thumbnails).pack(side=tk.LEFT, padx=6)
         ttk.Label(top, text="Click to open. Right-click for copy.").pack(side=tk.LEFT, padx=10)
@@ -3798,20 +2773,7 @@ class App:
         font = th.get("mono_family", "Consolas")
         size = th.get("mono_size", 10)
 
-        # Encode word cloud as inline base64 if available
         cloud_b64 = ""
-        try:
-            if self._stats_cloud_ref is not None:
-                # Extract PIL Image from the PhotoImage
-                pi = self._stats_cloud_ref
-                w, h = pi.width(), pi.height()
-                im = Image.new("RGB", (w, h))
-                # Build from string data
-                data = pi.get(0, 0)  # test access
-                # Alternative: re-generate the cloud to get PIL Image
-                pass
-        except Exception:
-            pass
 
         # Try to re-generate word cloud as PNG bytes for the export
         cloud_html = ""
