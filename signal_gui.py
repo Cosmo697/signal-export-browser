@@ -523,8 +523,12 @@ class App:
                 result.setdefault(mid, []).append(r)
         return result
 
-    def _rebuild_thumb_cache(self, log_func=None) -> None:
-        """Delete the .thumbcache/ directory and rebuild thumbnails for all known attachments."""
+    def _rebuild_thumb_cache(self, log_func=None, conn: Optional[sqlite3.Connection] = None) -> None:
+        """Delete the .thumbcache/ directory and rebuild thumbnails for all known attachments.
+
+        *conn* – optional explicit DB connection (e.g. thread-local).  Falls
+        back to ``self._conn`` when omitted.
+        """
         cache_dir = self._thumb_cache_dir()
         try:
             shutil.rmtree(str(cache_dir), ignore_errors=True)
@@ -533,12 +537,13 @@ class App:
             pass
         self._clear_photo_cache()
 
-        if self._conn is None:
+        db = conn or self._conn
+        if db is None:
             if log_func:
                 log_func("No DB connected — disk cache cleared only.")
             return
 
-        rows = self._conn.execute(
+        rows = db.execute(
             "SELECT abs_path, kind, file_name, duration_ms FROM attachments WHERE abs_path != '' AND kind IN ('image','video','audio')"
         ).fetchall()
         total = len(rows)
@@ -1900,19 +1905,25 @@ class App:
                 self.root.after(0, lambda: self._log("DB build complete."))
                 self._save_cache_state({"db_built": now_str, "db_path": str(out_path)})
 
-                # Auto-connect so thumbnails can query attachments
+                # --- Step 2: Build thumbnail cache ---
+                # Open a thread-local DB connection for the thumbnail query
+                # (self._conn lives on the main thread and can't be used here).
+                thumb_conn = sqlite3.connect(str(out_path))
+                thumb_conn.row_factory = sqlite3.Row
+                try:
+                    self.root.after(0, lambda: self._cache_status_var.set("Building thumbnail cache…"))
+                    self.root.after(0, lambda: self._log("Building thumbnail cache…"))
+                    self._rebuild_thumb_cache(log_func=log_cb, conn=thumb_conn)
+                    thumb_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self._save_cache_state({"thumbs_built": thumb_ts})
+                finally:
+                    thumb_conn.close()
+
+                # Now connect on the main thread so the GUI is ready
                 def _auto_connect() -> None:
                     self.db_path.set(str(out_path))
                     self._connect()
                 self.root.after(0, _auto_connect)
-                import time; time.sleep(0.3)  # let mainloop process connect
-
-                # --- Step 2: Build thumbnail cache ---
-                self.root.after(0, lambda: self._cache_status_var.set("Building thumbnail cache…"))
-                self.root.after(0, lambda: self._log("Building thumbnail cache…"))
-                self._rebuild_thumb_cache(log_func=log_cb)
-                thumb_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self._save_cache_state({"thumbs_built": thumb_ts})
 
                 self.root.after(0, lambda: self._log("BUILD ALL CACHE — Complete"))
                 self.root.after(0, lambda: self._refresh_cache_status())
