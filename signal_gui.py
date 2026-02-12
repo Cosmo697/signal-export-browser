@@ -1890,12 +1890,10 @@ class App:
                 # Disconnect if same DB is open
                 if self._conn is not None:
                     try:
-                        cur_db = Path(self.db_path.get()).resolve()
-                        if cur_db == out_path.resolve():
-                            self._conn.close()
-                            self._conn = None
+                        self._conn.close()
                     except Exception:
                         pass
+                    self._conn = None
 
                 self.root.after(0, lambda: self._cache_status_var.set("Building database…"))
                 build_signal_db.build_db(in_path, out_path, store_raw, log=log_cb)
